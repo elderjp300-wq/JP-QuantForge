@@ -1,0 +1,10 @@
+name: Build cTrader Algorithms
+
+on:
+  workflow_dispatch:
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Workflow placeholder. Build steps will be added later."
