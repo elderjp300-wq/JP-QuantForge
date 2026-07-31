@@ -4,7 +4,37 @@ on:
   workflow_dispatch:
 
 jobs:
-  placeholder:
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - run: echo "Workflow placeholder. Build steps will be added later."
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install cTrader Algo CLI
+        run: dotnet tool install -g cTrader.Automate.CLI
+
+      - name: Build Robots
+        run: |
+          mkdir -p artifacts
+
+          for project in $(find Robots -name "*.csproj"); do
+            echo "Building $project"
+            dotnet build "$project" --configuration Release
+
+            folder=$(dirname "$project")
+            name=$(basename "$project" .csproj)
+
+            find "$folder" -name "*.algo" -exec cp {} artifacts/ \; || true
+          done
+
+      - name: Upload Algo Files
+        uses: actions/upload-artifact@v4
+        with:
+          name: cTrader-algorithms
+          path: artifacts/
