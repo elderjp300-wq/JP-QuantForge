@@ -16,25 +16,27 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Install cTrader Algo CLI
-        run: dotnet tool install -g cTrader.Automate.CLI
-
       - name: Build Robots
         run: |
           mkdir -p artifacts
 
           for project in $(find Robots -name "*.csproj"); do
             echo "Building $project"
-            dotnet build "$project" --configuration Release
+            
+            # Restore and build the project cleanly
+            dotnet restore "$project"
+            dotnet build "$project" --configuration Release --no-restore
 
+            # Extract the folder and bot name
             folder=$(dirname "$project")
             name=$(basename "$project" .csproj)
 
-            find "$folder" -name "*.algo" -exec cp {} artifacts/ \; || true
+            # Find the compiled binary dll files and copy them to artifacts
+            find "$folder/bin/Release/" -name "*.dll" -exec cp {} artifacts/ \; || true
           done
 
-      - name: Upload Algo Files
+      - name: Upload Compiled Bots
         uses: actions/upload-artifact@v4
         with:
-          name: cTrader-algorithms
+          name: cTrader-compiled-robots
           path: artifacts/
