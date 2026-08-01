@@ -20,7 +20,7 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: '8.0.x' # Keep 8.0 or 6.0 based on your preference; SDK 8 easily builds .NET 6 apps
 
       - name: Verify Robot Path
         run: |
@@ -30,32 +30,24 @@ jobs:
             exit 1
           fi
 
-      - name: Build & Package Robot
+      - name: Build and Auto-Package .algo
         run: |
           mkdir -p artifacts
           TARGET_DIR="Robots/${{ github.event.inputs.robot_folder }}"
           
-          # 1. Build to check for errors (Compiles the DLL)
-          echo "Compiling $TARGET_DIR to check for errors..."
-          dotnet restore "$TARGET_DIR"
-          dotnet build "$TARGET_DIR" --configuration Release --no-restore
+          # Find the specific .csproj file for the chosen robot
+          PROJECT_FILE=$(find "$TARGET_DIR" -name "*.csproj" | head -n1)
+          echo "Building and packaging: $PROJECT_FILE"
+          
+          # Running standard build automatically generates the official .algo file via NuGet 1.0.17+
+          dotnet build "$PROJECT_FILE" -c Release
 
-          # 2. Create the .algo file (Zip the source code)
-          # We zip the folder containing the .csproj and .cs files
-          # cTrader Mobile uses this to install/cloud-compile the bot
-          
-          BOT_NAME="${{ github.event.inputs.robot_folder }}"
-          
-          echo "Packaging $BOT_NAME.algo..."
-          
-          # Navigate to the Robots folder so the zip path is clean (e.g., Grid/Grid.cs)
-          cd Robots
-          
-          # Zip the specific bot folder recursively, excluding the bin/obj folders to keep it clean
-          zip -r "../artifacts/$BOT_NAME.algo" "$BOT_NAME" -x "*/bin/*" "*/obj/*" "*/.git/*"
+          # Find the automatically generated .algo file and copy it to our clean artifacts folder
+          find "$TARGET_DIR" -name "*.algo" -exec cp {} artifacts/ \;
 
-      - name: Upload .algo Artifact
+      - name: Upload Official .algo Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.robot_folder }}-algo
           path: artifacts/*.algo
+          if-no-files-found: error
