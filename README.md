@@ -7,9 +7,11 @@ A professional monorepo for production-grade cTrader Automate (cBots) engineered
 
 | Robot Name | Target Folder | Execution Style | Primary Timeframe | Target Assets |
 | :--- | :--- | :--- | :--- | :--- |
+| **EMA Cross** | `EMA Cross` | Exponential MA Crossover + Session Filter | M5 / M15 | EURUSD / Major FX |
 | **Grid** | `Grid` | Grid Execution / Position Scaling | M5 / M15 | EURUSD / Major FX |
 | **LinReg Intercept v6** | `LinReg Intercept v6` | Regression Intercept Reversal | M5 / M15 | EURUSD / FX Majors |
 | **Momentum V6** | `Momentum V6` | Momentum Acceleration + ATR Trail | M5 (Primary) / M15 | EURUSD / XAUUSD |
+| **SMA Cross** | `SMA Cross` | Simple MA Crossover + Session Filter | M5 / M15 | EURUSD / Major FX |
 
 ---
 
@@ -21,12 +23,13 @@ Each robot is strictly self-contained within the `Robots/` directory:
 JP-QuantForge/
 ├── README.md               <-- Tier 1: Global Catalog, Build Pipeline & Troubleshooting
 └── Robots/
-    └── Momentum V6/        <-- Tier 2: Deep-Dive Strategy Specification
-        ├── Momentum V6.sln
-        ├── README.md
-        └── Momentum V6/
-            ├── Momentum V6.csproj
-            └── Momentum V6.cs
+    ├── EMA Cross/          <-- EMA Crossover Strategy
+    ├── Grid/               <-- Grid Trading System
+    ├── LinReg Intercept v6/ <-- Linear Regression Strategy
+    ├── Momentum V6/        <-- Momentum Acceleration System
+    └── SMA Cross/          <-- SMA Crossover Strategy
+
+---
 ```
 
 ## 🚀 JP-QuantForge Build & Deployment Protocol
