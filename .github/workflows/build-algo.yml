@@ -2,6 +2,12 @@ name: Build cTrader Algorithms
 
 on:
   workflow_dispatch:
+    inputs:
+      robot_folder:
+        description: 'Target Robot Folder Name (e.g., Grid, LinearRegressionInterceptV6)'
+        required: true
+        default: 'Grid'
+        type: string
 
 jobs:
   build:
@@ -16,27 +22,34 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Build Robots
+      - name: Verify Robot Path
+        run: |
+          TARGET_DIR="Robots/${{ github.event.inputs.robot_folder }}"
+          if [ ! -d "$TARGET_DIR" ]; then
+            echo "ERROR: Folder '$TARGET_DIR' does not exist in the repository."
+            exit 1
+          fi
+
+      - name: Build Targeted Robot
         run: |
           mkdir -p artifacts
-
-          for project in $(find Robots -name "*.csproj"); do
-            echo "Building $project"
+          TARGET_DIR="Robots/${{ github.event.inputs.robot_folder }}"
+          
+          # Find and build only the .csproj files inside the specified folder
+          for project in $(find "$TARGET_DIR" -name "*.csproj"); do
+            echo "Building targeted project: $project"
             
-            # Restore and build the project cleanly
             dotnet restore "$project"
             dotnet build "$project" --configuration Release --no-restore
 
-            # Extract the folder and bot name
             folder=$(dirname "$project")
-            name=$(basename "$project" .csproj)
-
-            # Find the compiled binary dll files and copy them to artifacts
+            
+            # Extract compiled assembly .dll outputs
             find "$folder/bin/Release/" -name "*.dll" -exec cp {} artifacts/ \; || true
           done
 
-      - name: Upload Compiled Bots
+      - name: Upload Compiled Bot
         uses: actions/upload-artifact@v4
         with:
-          name: cTrader-compiled-robots
+          name: ${{ github.event.inputs.robot_folder }}-compiled
           path: artifacts/
