@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       robot_folder:
-        description: 'Target Robot Folder Name (e.g., Grid, LinearRegressionInterceptV6)'
+        description: 'Target Robot Folder Name (e.g., Grid)'
         required: true
         default: 'Grid'
         type: string
@@ -26,30 +26,36 @@ jobs:
         run: |
           TARGET_DIR="Robots/${{ github.event.inputs.robot_folder }}"
           if [ ! -d "$TARGET_DIR" ]; then
-            echo "ERROR: Folder '$TARGET_DIR' does not exist in the repository."
+            echo "ERROR: Folder '$TARGET_DIR' does not exist."
             exit 1
           fi
 
-      - name: Build Targeted Robot
+      - name: Build & Package Robot
         run: |
           mkdir -p artifacts
           TARGET_DIR="Robots/${{ github.event.inputs.robot_folder }}"
           
-          # Find and build only the .csproj files inside the specified folder
-          for project in $(find "$TARGET_DIR" -name "*.csproj"); do
-            echo "Building targeted project: $project"
-            
-            dotnet restore "$project"
-            dotnet build "$project" --configuration Release --no-restore
+          # 1. Build to check for errors (Compiles the DLL)
+          echo "Compiling $TARGET_DIR to check for errors..."
+          dotnet restore "$TARGET_DIR"
+          dotnet build "$TARGET_DIR" --configuration Release --no-restore
 
-            folder=$(dirname "$project")
-            
-            # Extract compiled assembly .dll outputs
-            find "$folder/bin/Release/" -name "*.dll" -exec cp {} artifacts/ \; || true
-          done
+          # 2. Create the .algo file (Zip the source code)
+          # We zip the folder containing the .csproj and .cs files
+          # cTrader Mobile uses this to install/cloud-compile the bot
+          
+          BOT_NAME="${{ github.event.inputs.robot_folder }}"
+          
+          echo "Packaging $BOT_NAME.algo..."
+          
+          # Navigate to the Robots folder so the zip path is clean (e.g., Grid/Grid.cs)
+          cd Robots
+          
+          # Zip the specific bot folder recursively, excluding the bin/obj folders to keep it clean
+          zip -r "../artifacts/$BOT_NAME.algo" "$BOT_NAME" -x "*/bin/*" "*/obj/*" "*/.git/*"
 
-      - name: Upload Compiled Bot
+      - name: Upload .algo Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.robot_folder }}-compiled
-          path: artifacts/
+          name: ${{ github.event.inputs.robot_folder }}-algo
+          path: artifacts/*.algo
