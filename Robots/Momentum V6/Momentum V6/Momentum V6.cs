@@ -66,7 +66,7 @@ namespace cAlgo.Robots
             _currentPositionState = 0;
 
             // Wilder's Smoothing matches TradingView ta.atr()
-            _atr = Indicators.AverageTrueRange(AtrLength, MovingAverageType.WildersSmoothing);
+            _atr = Indicators.AverageTrueRange(AtrLength, MovingAverageType.WilderSmoothing);
 
             // Synchronize state with any active open position on startup
             SyncPositionState();
@@ -208,7 +208,7 @@ namespace cAlgo.Robots
             double rawVolume = riskAmount / lossPerUnit;
 
             // Normalize volume to broker steps and limits
-            double normalizedVolume = Symbol.NormalizeVolumeInUnits(rawVolume, RoundMode.Down);
+            double normalizedVolume = Symbol.NormalizeVolumeInUnits(rawVolume, RoundingMode.Down);
 
             if (normalizedVolume < Symbol.VolumeInUnitsMin)
                 normalizedVolume = Symbol.VolumeInUnitsMin;
@@ -237,10 +237,10 @@ namespace cAlgo.Robots
                 // Stop loss must only ratchet upward, never widen
                 if (!position.StopLoss.HasValue || targetSl > position.StopLoss.Value + (Symbol.PipSize * 0.1))
                 {
-                    ModifyPosition(position, targetSl, position.TakeProfit);
+                    ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
                 }
             }
-            else if (position.TradeType == TradeType.Sell)
+            else if (position.TradeType == SellType())
             {
                 // Reference Close of previous bar
                 double targetSl = Bars.ClosePrices.Last(1) + trailingDistance;
@@ -248,10 +248,12 @@ namespace cAlgo.Robots
                 // Stop loss must only ratchet downward, never widen
                 if (!position.StopLoss.HasValue || targetSl < position.StopLoss.Value - (Symbol.PipSize * 0.1))
                 {
-                    ModifyPosition(position, targetSl, position.TakeProfit);
+                    ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
                 }
             }
         }
+
+        private TradeType SellType() => TradeType.Sell;
 
         #endregion
     }
