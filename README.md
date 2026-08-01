@@ -95,3 +95,20 @@ For the GitHub Action to auto-package the `.algo` file successfully, every robot
 2. Open GitHub Web/Mobile App -> Navigate to **Actions** -> Select **Build cTrader Algorithms**.
 3. Click **Run workflow**, input the folder name (e.g., `Grid`), and hit execute.
 4. Download the generated artifact zip, extract it, and tap the `.algo` file to instantly install it into **cTrader Mobile**.
+
+---
+
+## 🛠️ Engineering Troubleshooting History & Lessons Learned
+
+### 🚨 Issue 1: Missing cTrader.Automate.CLI Tool
+* **The Problem:** The default Spotware pipeline script attempted to run `dotnet tool install -g cTrader.Automate.CLI` to package the bot. This threw a critical error because Spotware does not host this CLI packaging tool publicly on standard NuGet feeds (`api.nuget.org/v3/index.json`).
+* **The Fix:** We completely removed the external global CLI dependency step from our workflow. Instead, we rely entirely on standard, native `.NET SDK` build triggers to compile our code.
+
+### 🚨 Issue 2: Empty/Placeholder Template Projects Crashing the Build
+* **The Problem:** The original repository layout contained blank placeholder subfolders (`Template002`, `Template003`, etc.) with empty `.csproj` files. A broad directory scanning loop (`find Robots -name "*.csproj"`) tried to build everything alphabetically. MSBuild hit an empty `0-byte` XML template file, threw an `error MSB4025: Root element is missing`, and aborted the pipeline before reaching the functional bot folders.
+* **The Fix:** We converted the GitHub Action trigger to use `workflow_dispatch` with a manual text input variable (`robot_folder`). The script now uses a targeted path check to isolate and build *only* the specific active robot directory you tell it to run from your phone, gracefully skipping unused templates.
+
+### 🚨 Issue 3: The Missing/Rejected `.algo` Package Format on Mobile (The Core Breakthrough 💡)
+* **The Problem:** Standard Linux compilation output yields a raw `.dll` binary assembly file. However, cTrader Mobile completely rejects raw `.dll` binaries; it requires a native `.algo` source package to allow cloud importing and deployment. Manually zipping up directory files from the runner failed because cTrader Mobile looks for highly specific structural parameters within the package.
+* **The Root Cause:** The initial sample bot templates were referencing old, generic versions of the `cTrader.Automate` NuGet dependency library which did not include integrated archive routines.
+* **The Ultimate Fix:** **We updated the `.csproj` configuration to reference `cTrader.Automate` version `1.0.17` or higher.** Starting with version `1.0.8`, Spotware bundled the official `.algo` compiler/packager routine *directly inside the library's standard build pipeline hooks*. Running a standard `dotnet build` against version `1.0.17+` automatically creates a perfectly encoded, natively compliant `.algo` file right inside your build output folder without requiring any external zip code.
