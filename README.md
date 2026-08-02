@@ -7,13 +7,13 @@ A professional monorepo for production-grade cTrader Automate (cBots) engineered
 
 | Robot Name | Target Folder | Execution Style | Primary Timeframe | Target Assets |
 | :--- | :--- | :--- | :--- | :--- |
+| **CCI Engine** | `CCI Engine` | Custom Close-Based CCI State Machine | M5 / M15 | EURUSD / Major FX |
 | **EMA Cross** | `EMA Cross` | Exponential MA Crossover + Session Filter | M5 / M15 | EURUSD / Major FX |
 | **Grid** | `Grid` | Grid Execution / Position Scaling | M5 / M15 | EURUSD / Major FX |
+| **Hull & LinReg Forecast** | `Hull & LinReg Forecast` | Fast LinReg Forecast x Slow Hull MA | M5 / M15 | EURUSD / Major FX |
 | **LinReg Intercept v6** | `LinReg Intercept v6` | Regression Intercept Reversal | M5 / M15 | EURUSD / FX Majors |
 | **Momentum V6** | `Momentum V6` | Momentum Acceleration + ATR Trail | M5 (Primary) / M15 | EURUSD / XAUUSD |
 | **SMA Cross** | `SMA Cross` | Simple MA Crossover + Session Filter | M5 / M15 | EURUSD / Major FX |
-
----
 
 ## 🏛️ Monorepo Architecture
 
@@ -23,13 +23,13 @@ Each robot is strictly self-contained within the `Robots/` directory:
 JP-QuantForge/
 ├── README.md               <-- Tier 1: Global Catalog, Build Pipeline & Troubleshooting
 └── Robots/
+    ├── CCI Engine/         <-- Close-Based CCI State Machine Engine
     ├── EMA Cross/          <-- EMA Crossover Strategy
     ├── Grid/               <-- Grid Trading System
+    ├── Hull & LinReg Forecast/ <-- Fast LinReg Forecast x Slow Hull MA
     ├── LinReg Intercept v6/ <-- Linear Regression Strategy
     ├── Momentum V6/        <-- Momentum Acceleration System
     └── SMA Cross/          <-- SMA Crossover Strategy
-
----
 ```
 
 ## 🚀 JP-QuantForge Build & Deployment Protocol
