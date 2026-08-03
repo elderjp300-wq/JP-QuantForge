@@ -6,379 +6,374 @@ using cAlgo.API.Internals;
 
 namespace cAlgo.Robots
 {
-    [Robot(AccessRights = AccessRights.None)]
-    public class LinRegInterceptV6 : Robot
+    public enum TrailingMode
     {
-        #region Parameters - Core Engine
-        [Parameter("Price Source", Group = "Core Engine")]
-        public DataSeries PriceSource { get; set; }
+        AtrTrail,
+        PipsTrail,
+        Disabled
+    }
 
-        [Parameter("LRI Length", Group = "Core Engine", DefaultValue = 9, MinValue = 1)]
-        public int LriLength { get; set; }
-        #endregion
+    public enum SizingMode
+    {
+        FixedLots,
+        RiskPercentage
+    }
 
-        #region Parameters - ATR Settings
-        [Parameter("ATR Length", Group = "ATR Settings", DefaultValue = 14, MinValue = 1)]
+    public enum CapitalType
+    {
+        Balance,
+        Equity
+    }
+
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class LinRegInterceptv6 : Robot
+    {
+        #region Strategy Parameters
+
+        [Parameter("Fast LinReg Period", Group = "Strategy Indicators", DefaultValue = 7, MinValue = 2)]
+        public int FastPeriod { get; set; }
+
+        [Parameter("Slow LinReg Period", Group = "Strategy Indicators", DefaultValue = 21, MinValue = 2)]
+        public int SlowPeriod { get; set; }
+
+        [Parameter("Trailing Stop Mode", Group = "Trailing & Exits", DefaultValue = TrailingMode.AtrTrail)]
+        public TrailingMode TrailingType { get; set; }
+
+        [Parameter("Pips SL / Trailing Distance", Group = "Trailing & Exits", DefaultValue = 20.0, MinValue = 1.0, Step = 0.5)]
+        public double PipsStopLoss { get; set; }
+
+        [Parameter("ATR Length", Group = "Trailing & Exits", DefaultValue = 14, MinValue = 1)]
         public int AtrLength { get; set; }
 
-        [Parameter("ATR Multiplier", Group = "ATR Settings", DefaultValue = 2.0, MinValue = 0.1)]
-        public double AtrMultiplier { get; set; }
-        #endregion
+        [Parameter("ATR SL Multiplier", Group = "Trailing & Exits", DefaultValue = 2.0, MinValue = 0.1, Step = 0.1)]
+        public double AtrSlMultiplier { get; set; }
 
-        #region Parameters - Trailing Logic
-        [Parameter("Enable ATR Trailing Stop", Group = "Trailing Logic", DefaultValue = true)]
-        public bool EnableTrailingStop { get; set; }
-        #endregion
+        [Parameter("ATR Step Filter (Pips)", Group = "Trailing & Exits", DefaultValue = 0.5, MinValue = 0.1, Step = 0.1)]
+        public double AtrStepPips { get; set; }
 
-        #region Parameters - Position Sizing
-        [Parameter("Sizing Method (0=Fixed, 1=Risk%)", Group = "Volume Management", DefaultValue = 0, MinValue = 0, MaxValue = 1)]
-        public int SizingMethod { get; set; }
+        [Parameter("Sizing Mode", Group = "Position Sizing", DefaultValue = SizingMode.RiskPercentage)]
+        public SizingMode Sizing { get; set; }
 
-        [Parameter("Fixed Lot Size", Group = "Volume Management", DefaultValue = 0.1, MinValue = 0.01)]
-        public double FixedLotSize { get; set; }
+        [Parameter("Capital Base", Group = "Position Sizing", DefaultValue = CapitalType.Equity)]
+        public CapitalType CapitalBase { get; set; }
 
-        [Parameter("Risk Percent (%)", Group = "Volume Management", DefaultValue = 1.0, MinValue = 0.1, MaxValue = 100.0)]
+        [Parameter("Risk Percentage (%)", Group = "Position Sizing", DefaultValue = 0.25, MinValue = 0.01, Step = 0.05)]
         public double RiskPercent { get; set; }
+
+        [Parameter("Fixed Volume (Lots)", Group = "Position Sizing", DefaultValue = 0.1, MinValue = 0.01, Step = 0.01)]
+        public double FixedVolumeLots { get; set; }
+
+        [Parameter("Enable Session Filter", Group = "Filters", DefaultValue = false)]
+        public bool EnableSessionFilter { get; set; }
+
+        [Parameter("Start Hour (UTC)", Group = "Filters", DefaultValue = 7, MinValue = 0, MaxValue = 23)]
+        public int StartHourUtc { get; set; }
+
+        [Parameter("End Hour (UTC)", Group = "Filters", DefaultValue = 16, MinValue = 0, MaxValue = 23)]
+        public int EndHourUtc { get; set; }
+
+        [Parameter("Max Spread (Pips)", Group = "Filters", DefaultValue = 1.2, MinValue = 0.1, Step = 0.1)]
+        public double MaxSpreadPips { get; set; }
+
+        [Parameter("Instance Label", Group = "Execution", DefaultValue = "LINREG_INT_v6")]
+        public string InstanceLabel { get; set; }
+
         #endregion
 
-        #region Parameters - Risk Limits
-        [Parameter("Max Daily Loss (%)", Group = "Risk Management", DefaultValue = 2.0, MinValue = 0.0, MaxValue = 100.0)]
-        public double MaxDailyLossPercent { get; set; }
+        #region Private Fields
+
+        private AverageTrueRange _atr;
+        private TradeType? _pendingSignal = null;
+        private int _pendingSignalBar = -1;
+
         #endregion
 
-        #region Parameters - Session Filters
-        [Parameter("Enable Asia Session", Group = "Asia Session", DefaultValue = false)]
-        public bool EnableAsia { get; set; }
+        #region Lifecycle Methods
 
-        [Parameter("Asia Start Hour (UTC+1)", Group = "Asia Session", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 23.99)]
-        public double AsiaStartHour { get; set; }
-
-        [Parameter("Asia End Hour (UTC+1)", Group = "Asia Session", DefaultValue = 8.0, MinValue = 0.0, MaxValue = 23.99)]
-        public double AsiaEndHour { get; set; }
-
-
-        [Parameter("Enable London Session", Group = "London Session", DefaultValue = true)]
-        public bool EnableLondon { get; set; }
-
-        [Parameter("London Start Hour (UTC+1)", Group = "London Session", DefaultValue = 8.0, MinValue = 0.0, MaxValue = 23.99)]
-        public double LondonStartHour { get; set; }
-
-        [Parameter("London End Hour (UTC+1)", Group = "London Session", DefaultValue = 16.0, MinValue = 0.0, MaxValue = 23.99)]
-        public double LondonEndHour { get; set; }
-
-
-        [Parameter("Enable NY Session", Group = "New York Session", DefaultValue = true)]
-        public bool EnableNewYork { get; set; }
-
-        [Parameter("NY Start Hour (UTC+1)", Group = "New York Session", DefaultValue = 13.0, MinValue = 0.0, MaxValue = 23.99)]
-        public double NewYorkStartHour { get; set; }
-
-        [Parameter("NY End Hour (UTC+1)", Group = "New York Session", DefaultValue = 21.0, MinValue = 0.0, MaxValue = 23.99)]
-        public double NewYorkEndHour { get; set; }
-
-
-        [Parameter("Enable London/NY Overlap", Group = "Overlap Session", DefaultValue = true)]
-        public bool EnableOverlap { get; set; }
-
-        [Parameter("Overlap Start Hour (UTC+1)", Group = "Overlap Session", DefaultValue = 13.0, MinValue = 0.0, MaxValue = 23.99)]
-        public double OverlapStartHour { get; set; }
-
-        [Parameter("Overlap End Hour (UTC+1)", Group = "Overlap Session", DefaultValue = 16.0, MinValue = 0.0, MaxValue = 23.99)]
-        public double OverlapEndHour { get; set; }
-        #endregion
-
-        #region Internal Fields
-        private LinearRegressionIntercept _lriIndicator;
-        private AverageTrueRange _atrIndicator;
-        private string _botLabel;
-        private DateTime _lastTradingDay;
-        private double _startingEquityForDay;
-        private bool _dailyLossLimitReached;
-        #endregion
-
-        #region Session Engine Helpers
-        private DateTime GetUtcPlus1Time()
-        {
-            // Translates server time directly to explicit UTC+1 as required by specification
-            return Server.TimeInUtc.AddHours(1);
-        }
-
-        private bool IsCurrentSessionAllowed()
-        {
-            DateTime timeInUtcPlus1 = GetUtcPlus1Time();
-            double currentHour = timeInUtcPlus1.Hour + (timeInUtcPlus1.Minute / 60.0);
-
-            // Audit Note: Handles regular sessions and boundary wrapping securely
-            if (EnableOverlap && IsTimeInSession(currentHour, OverlapStartHour, OverlapEndHour)) return true;
-            if (EnableNewYork && IsTimeInSession(currentHour, NewYorkStartHour, NewYorkEndHour)) return true;
-            if (EnableLondon && IsTimeInSession(currentHour, LondonStartHour, LondonEndHour)) return true;
-            if (EnableAsia && IsTimeInSession(currentHour, AsiaStartHour, AsiaEndHour)) return true;
-
-            return false;
-        }
-
-        private bool IsTimeInSession(double currentHour, double startHour, double endHour)
-        {
-            if (startHour <= endHour)
-            {
-                return currentHour >= startHour && currentHour < endHour;
-            }
-            // Handles overnight sessions if configured (e.g., 22:00 to 04:00)
-            return currentHour >= startHour || currentHour < endHour;
-        }
-        #endregion
-
-        #region Logging Module
-        private void LogEvent(string eventType, string message)
-        {
-            string timestamp = GetUtcPlus1Time().ToString("yyyy-MM-dd HH:mm:ss");
-            Print("[{0}] [{1}] {2}", timestamp, eventType, message);
-        }
-        #endregion
-
-        #region Risk Engine & Capital Protection
-        private double CalculateExecutionVolume(double stopLossDistancePrice)
-        {
-            if (stopLossDistancePrice <= 0)
-            {
-                LogEvent("Trade Rejection", "Calculated Stop Loss distance is invalid (zero or negative).");
-                return 0;
-            }
-
-            if (SizingMethod == 0) // Fixed Lots Mode
-            {
-                double units = Symbol.QuantityToVolumeInUnits(FixedLotSize);
-                return NormalizeVolume(units);
-            }
-
-            // Risk Percentage Mode Math
-            // Cash Risk = Balance * RiskPercent
-            double maxRiskCash = Account.Balance * (RiskPercent / 100.0);
-            
-            // cTrader Native Volume Calculation based on absolute price distance
-            // Formula: Units = Risk Cash / (Stop Loss Distance in Price * Tick Value / Tick Size)
-            double preciseUnits = maxRiskCash / (stopLossDistancePrice * (Symbol.TickValue / Symbol.TickSize));
-            double normalizedUnits = NormalizeVolume(preciseUnits);
-
-            // Cross-verify true risk after applying broker rounding steps
-            double actualRiskCash = normalizedUnits * stopLossDistancePrice * (Symbol.TickValue / Symbol.TickSize);
-            
-            if (actualRiskCash > maxRiskCash)
-            {
-                string warningMsg = string.Format("Risk limit exceeded due to lot rounding constraints. Max Allowed: {0:F2} USD. Calculated Actual: {1:F2} USD.", maxRiskCash, actualRiskCash);
-                LogEvent("Trade Rejection", warningMsg);
-                return 0;
-            }
-
-            return normalizedUnits;
-        }
-
-        private double NormalizeVolume(double rawUnits)
-        {
-            if (rawUnits < Symbol.VolumeInUnitsMin) return Symbol.VolumeInUnitsMin;
-            if (rawUnits > Symbol.VolumeInUnitsMax) return Symbol.VolumeInUnitsMax;
-
-            // Align precisely with broker unit increments
-            double remainder = rawUnits % Symbol.VolumeInUnitsStep;
-            double cleanUnits = rawUnits - remainder;
-
-            if (cleanUnits < Symbol.VolumeInUnitsMin) return Symbol.VolumeInUnitsMin;
-            return cleanUnits;
-        }
-
-        private void UpdateDailyLossTracking()
-        {
-            DateTime currentUtcPlus1 = GetUtcPlus1Time();
-
-            // Midnight Reset Logic
-            if (currentUtcPlus1.Date != _lastTradingDay)
-            {
-                _lastTradingDay = currentUtcPlus1.Date;
-                _startingEquityForDay = Account.Equity;
-                _dailyLossLimitReached = false;
-                LogEvent("Risk Management", "New trading day detected (UTC+1). Daily tracking metrics have been reset.");
-            }
-
-            if (_dailyLossLimitReached) return;
-
-            // Calculate total realized loss using Equity drawdown from midnight
-            double dailyLossLimitAmount = _startingEquityForDay * (MaxDailyLossPercent / 100.0);
-            double currentDrawdown = _startingEquityForDay - Account.Equity;
-
-            if (currentDrawdown >= dailyLossLimitAmount)
-            {
-                _dailyLossLimitReached = true;
-                string limitMsg = string.Format("Daily loss limit of {0}% hit. Max Loss: {1:F2} USD. Current Drawdown: {2:F2} USD. Entries suspended.", MaxDailyLossPercent, dailyLossLimitAmount, currentDrawdown);
-                LogEvent("Daily Loss Limit Reached", limitMsg);
-            }
-        }
-        #endregion
-
-        #region Core cBot Lifecycle Events
         protected override void OnStart()
         {
-            // Establish unique matching identifier label for position parsing
-            _botLabel = string.Format("LRI_V6_{0}_{1}", SymbolName, TimeFrame);
-            LogEvent("Startup", string.Format("Initializing LinReg Intercept v6 on {0} ({1})", SymbolName, TimeFrame));
+            _atr = Indicators.AverageTrueRange(AtrLength, MovingAverageType.WilderSmoothing);
 
-            // Load native high-performance indicator classes safely
-            _lriIndicator = Indicators.LinearRegressionIntercept(PriceSource, LriLength);
-            _atrIndicator = Indicators.AverageTrueRange(AtrLength, MovingAverageType.Simple);
+            Print("[INIT] LinReg Intercept v6 | Asset: {0} | TF: {1} | TrailingMode: {2} | Risk: {3}% ({4})",
+                SymbolName, TimeFrame, TrailingType, RiskPercent, CapitalBase);
+        }
 
-            // Establish day tracking anchor points based on UTC+1 translation matrix
-            _lastTradingDay = GetUtcPlus1Time().Date;
-            _startingEquityForDay = Account.Equity;
-            _dailyLossLimitReached = false;
+        protected override void OnBar()
+        {
+            // 1. Manage Dynamic ATR Trailing on Completed Bar Close
+            if (TrailingType == TrailingMode.AtrTrail)
+            {
+                ManageDynamicAtrTrailing();
+            }
 
-            LogEvent("Parameters Loaded", string.Format("LRI Length: {0} | ATR Length: {1} | Multiplier: {2} | Sizing: {3}", LriLength, AtrLength, AtrMultiplier, SizingMethod));
+            // 2. Clear expired pending signals from previous bar
+            if (_pendingSignal.HasValue && _pendingSignalBar != Bars.Count - 1)
+            {
+                Print("[SIGNAL EXPIRED] Pending {0} signal from bar #{1} expired unexecuted.", _pendingSignal, _pendingSignalBar);
+                _pendingSignal = null;
+                _pendingSignalBar = -1;
+            }
+
+            // 3. Ensure sufficient historical bars exist
+            int minRequiredBars = Math.Max(FastPeriod, SlowPeriod) + 10;
+            if (Bars.Count <= minRequiredBars)
+                return;
+
+            // 4. Compute Fast & Slow LinReg Intercepts for bar t=1 and t=2
+            double fastCurr = CalculateLinRegIntercept(1, FastPeriod);
+            double fastPrev = CalculateLinRegIntercept(2, FastPeriod);
+
+            double slowCurr = CalculateLinRegIntercept(1, SlowPeriod);
+            double slowPrev = CalculateLinRegIntercept(2, SlowPeriod);
+
+            bool longCross = (fastPrev <= slowPrev) && (fastCurr > slowCurr);
+            bool shortCross = (fastPrev >= slowPrev) && (fastCurr < slowCurr);
+
+            if (longCross)
+            {
+                Print("[CROSSOVER DETECTED] BULLISH Cross at Bar #{0} | Fast Intercept: {1:F5} > Slow Intercept: {2:F5}",
+                    Bars.Count - 1, fastCurr, slowCurr);
+                SetPendingSignal(TradeType.Buy);
+            }
+            else if (shortCross)
+            {
+                Print("[CROSSOVER DETECTED] BEARISH Cross at Bar #{0} | Fast Intercept: {1:F5} < Slow Intercept: {2:F5}",
+                    Bars.Count - 1, fastCurr, slowCurr);
+                SetPendingSignal(TradeType.Sell);
+            }
+
+            // 5. Attempt execution immediately if tick conditions permit
+            ProcessPendingSignal();
         }
 
         protected override void OnTick()
         {
-            // Execute real-time risk checks against equity adjustments on every tick change
-            UpdateDailyLossTracking();
-
-            // Handle intra-bar trailing stop parameters cleanly if verified active
-            if (EnableTrailingStop && !_dailyLossLimitReached)
+            // Process pending signal if spread was too wide at bar open
+            if (_pendingSignal.HasValue)
             {
-                ManageTrailingStops();
+                ProcessPendingSignal();
             }
         }
+
         #endregion
 
-        #region Trailing Stop Engine
-        private void ManageTrailingStops()
-        {
-            // Find our active position managed by this robot instance
-            var position = Positions.Find(_botLabel);
-            if (position == null) return;
+        #region Core Execution Engine
 
-            // Use the closing value of the last completed bar to prevent whip-saw anomalies
-            double atrValue = _atrIndicator.Result.Last(1);
-            double targetDistancePrice = atrValue * AtrMultiplier;
+        private void SetPendingSignal(TradeType type)
+        {
+            _pendingSignal = type;
+            _pendingSignalBar = Bars.Count - 1;
+        }
+
+        private void ProcessPendingSignal()
+        {
+            if (!_pendingSignal.HasValue)
+                return;
+
+            TradeType targetType = _pendingSignal.Value;
+
+            // Check Session Filter
+            if (!IsWithinTradingSession())
+            {
+                Print("[EXECUTION BLOCKED] Signal {0} suppressed - outside trading session ({1}:00 UTC).",
+                    targetType, Server.Time.Hour);
+                _pendingSignal = null;
+                return;
+            }
+
+            // Check Spread Condition
+            double currentSpreadPips = Symbol.Spread / Symbol.PipSize;
+            if (currentSpreadPips > MaxSpreadPips)
+            {
+                // Wait for next tick within the same bar
+                return;
+            }
+
+            // Handle Active Positions / Atomic Reversals
+            var activePosition = Positions.FirstOrDefault(p => p.Label == InstanceLabel && p.SymbolName == SymbolName);
+            if (activePosition != null)
+            {
+                if (activePosition.TradeType == targetType)
+                {
+                    _pendingSignal = null;
+                    return;
+                }
+
+                Print("[REVERSAL] Closing existing {0} position #{1} prior to opening {2}.",
+                    activePosition.TradeType, activePosition.Id, targetType);
+
+                var closeResult = ClosePosition(activePosition);
+                if (!closeResult.IsSuccessful)
+                {
+                    Print("[ERROR] Failed to close position #{0} for reversal. Reason: {1}",
+                        activePosition.Id, closeResult.Error);
+                    return; // Will retry on next tick
+                }
+            }
+
+            // Calculate SL Distance
+            double slDistancePips = GetInitialStopLossPips();
+            if (slDistancePips <= 0)
+            {
+                Print("[ERROR] Invalid SL distance ({0:F2} pips). Signal aborted.", slDistancePips);
+                _pendingSignal = null;
+                return;
+            }
+
+            // Calculate Volume
+            double volumeInUnits = CalculateVolume(slDistancePips);
+            if (volumeInUnits < Symbol.VolumeInUnitsMin)
+            {
+                Print("[ERROR] Calculated volume ({0}) below symbol minimum ({1}). Order aborted.",
+                    volumeInUnits, Symbol.VolumeInUnitsMin);
+                _pendingSignal = null;
+                return;
+            }
+
+            // Native Trailing Flag (True only for PipsTrail mode)
+            bool useNativeTsl = (TrailingType == TrailingMode.PipsTrail);
+
+            // Execute Market Order
+            var result = ExecuteMarketOrder(targetType, SymbolName, volumeInUnits, InstanceLabel, slDistancePips, null, null, useNativeTsl);
+            
+            if (result.IsSuccessful)
+            {
+                Print("[ORDER SUCCESS] #{0} {1} | Vol: {2} units | SL: {3:F1} pips | Native TSL: {4}",
+                    result.Position.Id, targetType, volumeInUnits, slDistancePips, useNativeTsl);
+                _pendingSignal = null;
+            }
+            else
+            {
+                Print("[ORDER FAILED] Reason: {0}", result.Error);
+            }
+        }
+
+        private double GetInitialStopLossPips()
+        {
+            if (TrailingType == TrailingMode.PipsTrail)
+            {
+                return PipsStopLoss;
+            }
+
+            // AtrTrail or Disabled with ATR
+            double atrVal = _atr.Result.Last(1);
+            if (double.IsNaN(atrVal) || atrVal <= 0)
+                return PipsStopLoss;
+
+            return (atrVal * AtrSlMultiplier) / Symbol.PipSize;
+        }
+
+        private double CalculateVolume(double slDistancePips)
+        {
+            if (Sizing == SizingMode.FixedLots)
+            {
+                return Symbol.QuantityToVolumeInUnits(FixedVolumeLots);
+            }
+
+            double capital = CapitalBase == CapitalType.Equity ? Account.Equity : Account.Balance;
+            double riskAmount = capital * (RiskPercent / 100.0);
+
+            double lossPerUnit = slDistancePips * Symbol.PipValue;
+            if (lossPerUnit <= 0)
+                return Symbol.VolumeInUnitsMin;
+
+            double rawVolume = riskAmount / lossPerUnit;
+            double normalizedVolume = Symbol.NormalizeVolumeInUnits(rawVolume, RoundingMode.Down);
+
+            if (normalizedVolume < Symbol.VolumeInUnitsMin)
+                normalizedVolume = Symbol.VolumeInUnitsMin;
+
+            if (normalizedVolume > Symbol.VolumeInUnitsMax)
+                normalizedVolume = Symbol.VolumeInUnitsMax;
+
+            return normalizedVolume;
+        }
+
+        private void ManageDynamicAtrTrailing()
+        {
+            var position = Positions.FirstOrDefault(p => p.Label == InstanceLabel && p.SymbolName == SymbolName);
+            if (position == null)
+                return;
+
+            double atrVal = _atr.Result.Last(1);
+            if (double.IsNaN(atrVal) || atrVal <= 0)
+                return;
+
+            double trailDistance = atrVal * AtrSlMultiplier;
+            double minStepInPrice = AtrStepPips * Symbol.PipSize;
 
             if (position.TradeType == TradeType.Buy)
             {
-                // Dynamic distance calculated relative to current execution Ask price
-                double newStopLossPrice = Symbol.Ask - targetDistancePrice;
-                newStopLossPrice = Math.Round(newStopLossPrice, Symbol.Digits);
+                double currentClose = Bars.ClosePrices.Last(1);
+                double targetSl = currentClose - trailDistance;
 
-                // Enforce Rule: Only tighten stop, never increase financial exposure
-                if (position.StopLoss == null || newStopLossPrice > position.StopLoss)
+                if (!position.StopLoss.HasValue || (targetSl - position.StopLoss.Value >= minStepInPrice))
                 {
-                    ModifyPosition(position, newStopLossPrice, position.TakeProfit);
-                    LogEvent("Trailing Stop", string.Format("Buy SL updated -> {0}", newStopLossPrice));
+                    ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
+                    Print("[DYNAMIC ATR TRAIL] Updated Buy SL to {0:F5} (Step >= {1:F1} pips)", targetSl, AtrStepPips);
                 }
             }
             else if (position.TradeType == TradeType.Sell)
             {
-                // Dynamic distance calculated relative to current execution Bid price
-                double newStopLossPrice = Symbol.Bid + targetDistancePrice;
-                newStopLossPrice = Math.Round(newStopLossPrice, Symbol.Digits);
+                double currentClose = Bars.ClosePrices.Last(1);
+                double targetSl = currentClose + trailDistance;
 
-                // Enforce Rule: Only tighten stop, never increase financial exposure
-                if (position.StopLoss == null || newStopLossPrice < position.StopLoss)
+                if (!position.StopLoss.HasValue || (position.StopLoss.Value - targetSl >= minStepInPrice))
                 {
-                    ModifyPosition(position, newStopLossPrice, position.TakeProfit);
-                    LogEvent("Trailing Stop", string.Format("Sell SL updated -> {0}", newStopLossPrice));
+                    ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
+                    Print("[DYNAMIC ATR TRAIL] Updated Sell SL to {0:F5} (Step >= {1:F1} pips)", targetSl, AtrStepPips);
                 }
             }
         }
-        #endregion
 
-        #region Strategy & Execution Engine
-        protected override void OnBar()
+        private bool IsWithinTradingSession()
         {
-            // 1. Maintain time keeping checks at every candle transition
-            UpdateDailyLossTracking();
+            if (!EnableSessionFilter)
+                return true;
 
-            // 2. Enforce safety checks before looking at strategy logic
-            if (_dailyLossLimitReached) return;
-            if (!IsCurrentSessionAllowed()) return;
-
-            // 3. Evaluate Crossover Strategy Metrics
-            // Index 1 = The bar that just closed. Index 2 = The bar before it.
-            double currentClose = MarketSeries.Close.Last(1);
-            double previousClose = MarketSeries.Close.Last(2);
-
-            double currentLri = _lriIndicator.Result.Last(1);
-            double previousLri = _lriIndicator.Result.Last(2);
-
-            // Buy Condition: Closed above LRI after previously being below or equal
-            bool buySignal = previousClose <= previousLri && currentClose > currentLri;
-            
-            // Sell Condition: Closed below LRI after previously being above or equal
-            bool sellSignal = previousClose >= previousLri && currentClose < currentLri;
-
-            if (buySignal)
+            int currentHour = Server.Time.Hour;
+            if (StartHourUtc <= EndHourUtc)
             {
-                string signalLog = string.Format("Bullish Crossover. Close(1): {0} > LRI(1): {1}", currentClose, currentLri);
-                LogEvent("Signal Detected", signalLog);
-                ExecuteTradeSequence(TradeType.Buy);
-            }
-            else if (sellSignal)
-            {
-                string signalLog = string.Format("Bearish Crossover. Close(1): {0} < LRI(1): {1}", currentClose, currentLri);
-                LogEvent("Signal Detected", signalLog);
-                ExecuteTradeSequence(TradeType.Sell);
-            }
-        }
-
-        private void ExecuteTradeSequence(TradeType targetDirection)
-        {
-            var activePosition = Positions.Find(_botLabel);
-
-            // Handle existing trades matching or opposing the current signal
-            if (activePosition != null)
-            {
-                if (activePosition.TradeType == targetDirection)
-                {
-                    LogEvent("Ignored Signal", "Position already exists in this direction. Rule: One position per direction.");
-                    return;
-                }
-
-                // Rule: Opposite signal closes current trade instantly
-                string closeLog = string.Format("Opposite signal received. Closing active {0} position ID: {1}", activePosition.TradeType, activePosition.Id);
-                LogEvent("Position Closure", closeLog);
-                ClosePosition(activePosition);
-                
-                // Halt execution sequence for this tick to allow the broker to safely clear database state.
-                // The position management system will automatically cycle entry routines on the next available interval.
-                return;
-            }
-
-            // Calculate precise ATR stop loss price distance
-            double atrValue = _atrIndicator.Result.Last(1);
-            double stopLossDistancePrice = atrValue * AtrMultiplier;
-
-            // Compute broker volume units using audited risk allocation matrix
-            double volumeInUnits = CalculateExecutionVolume(stopLossDistancePrice);
-            if (volumeInUnits <= 0) return; // Rejection log handled inside risk module
-
-            // Convert raw price distance into explicit Pips for the cTrader execution engine
-            double stopLossInPips = stopLossDistancePrice / Symbol.PipSize;
-
-            string submissionLog = string.Format("Submitting {0} Order | Volume: {1} Units | Initial SL Pips: {2:F1}", targetDirection, volumeInUnits, stopLossInPips);
-            LogEvent("Order Submission", submissionLog);
-
-            var executionResult = ExecuteMarketOrder(targetDirection, SymbolName, volumeInUnits, _botLabel, stopLossInPips, null);
-
-            if (executionResult.IsSuccessful)
-            {
-                string successLog = string.Format("Successfully opened {0} position ID: {1}", targetDirection, executionResult.Position.Id);
-                LogEvent("Order Executed", successLog);
+                return currentHour >= StartHourUtc && currentHour < EndHourUtc;
             }
             else
             {
-                string errorLog = string.Format("Broker Order Rejection. Reason: {0}", executionResult.Error);
-                LogEvent("Broker Error", errorLog);
+                return currentHour >= StartHourUtc || currentHour < EndHourUtc;
             }
         }
 
-        protected override void OnStop()
+        #endregion
+
+        #region Custom Indicator Engine (Linear Regression Intercept)
+
+        private double CalculateLinRegIntercept(int shift, int length)
         {
-            LogEvent("Shutdown", "LinReg Intercept v6 successfully suspended. Dynamic monitoring disabled.");
+            if (Bars.Count < shift + length)
+                return Bars.ClosePrices.Last(shift);
+
+            double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+
+            for (int i = 0; i < length; i++)
+            {
+                double x = i;
+                double y = Bars.ClosePrices.Last(shift + length - 1 - i);
+
+                sumX += x;
+                sumY += y;
+                sumXY += x * y;
+                sumX2 += x * x;
+            }
+
+            double divisor = (length * sumX2 - sumX * sumX);
+            if (Math.Abs(divisor) < 1e-9)
+                return Bars.ClosePrices.Last(shift);
+
+            double slope = (length * sumXY - sumX * sumY) / divisor;
+            double intercept = (sumY - slope * sumX) / length;
+
+            return intercept;
         }
+
         #endregion
     }
 }
