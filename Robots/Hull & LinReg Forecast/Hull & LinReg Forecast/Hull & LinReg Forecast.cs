@@ -6,6 +6,13 @@ using cAlgo.API.Internals;
 
 namespace cAlgo.Robots
 {
+    public enum TrailingMode
+    {
+        AtrTrail,
+        PipsTrail,
+        Disabled
+    }
+
     public enum SizingMode
     {
         FixedLots,
@@ -19,36 +26,30 @@ namespace cAlgo.Robots
     }
 
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
-    public class HullLinRegForecast : Robot
+    public class HullAndLinRegForecast : Robot
     {
         #region Strategy Parameters
 
-        [Parameter("LinReg Forecast Period (Fast)", Group = "Indicators", DefaultValue = 14, MinValue = 2)]
+        [Parameter("LinReg Forecast Period", Group = "Strategy Indicators", DefaultValue = 14, MinValue = 2)]
         public int LinRegPeriod { get; set; }
 
-        [Parameter("Hull MA Period (Slow)", Group = "Indicators", DefaultValue = 21, MinValue = 2)]
+        [Parameter("Hull MA Period", Group = "Strategy Indicators", DefaultValue = 21, MinValue = 2)]
         public int HullPeriod { get; set; }
 
-        [Parameter("Enable Session Filter", Group = "Session Filter", DefaultValue = false)]
-        public bool EnableSessionFilter { get; set; }
+        [Parameter("Trailing Stop Mode", Group = "Trailing & Exits", DefaultValue = TrailingMode.AtrTrail)]
+        public TrailingMode TrailingType { get; set; }
 
-        [Parameter("Start Hour (UTC)", Group = "Session Filter", DefaultValue = 7, MinValue = 0, MaxValue = 23)]
-        public int StartHourUtc { get; set; }
+        [Parameter("Pips SL / Trailing Distance", Group = "Trailing & Exits", DefaultValue = 20.0, MinValue = 1.0, Step = 0.5)]
+        public double PipsStopLoss { get; set; }
 
-        [Parameter("End Hour (UTC)", Group = "Session Filter", DefaultValue = 17, MinValue = 0, MaxValue = 23)]
-        public int EndHourUtc { get; set; }
-
-        [Parameter("ATR Length", Group = "Risk & Exits", DefaultValue = 14, MinValue = 1)]
+        [Parameter("ATR Length", Group = "Trailing & Exits", DefaultValue = 14, MinValue = 1)]
         public int AtrLength { get; set; }
 
-        [Parameter("ATR SL Multiplier", Group = "Risk & Exits", DefaultValue = 2.0, MinValue = 0.1, Step = 0.1)]
+        [Parameter("ATR SL Multiplier", Group = "Trailing & Exits", DefaultValue = 2.0, MinValue = 0.1, Step = 0.1)]
         public double AtrSlMultiplier { get; set; }
 
-        [Parameter("Enable Trailing Stop", Group = "Risk & Exits", DefaultValue = true)]
-        public bool EnableTrailingStop { get; set; }
-
-        [Parameter("Exit on Opposite Cross", Group = "Risk & Exits", DefaultValue = true)]
-        public bool ExitOnOppositeCross { get; set; }
+        [Parameter("ATR Step Filter (Pips)", Group = "Trailing & Exits", DefaultValue = 0.5, MinValue = 0.1, Step = 0.1)]
+        public double AtrStepPips { get; set; }
 
         [Parameter("Sizing Mode", Group = "Position Sizing", DefaultValue = SizingMode.RiskPercentage)]
         public SizingMode Sizing { get; set; }
@@ -56,25 +57,34 @@ namespace cAlgo.Robots
         [Parameter("Capital Base", Group = "Position Sizing", DefaultValue = CapitalType.Equity)]
         public CapitalType CapitalBase { get; set; }
 
-        [Parameter("Risk Percentage (%)", Group = "Position Sizing", DefaultValue = 1.0, MinValue = 0.01, Step = 0.1)]
+        [Parameter("Risk Percentage (%)", Group = "Position Sizing", DefaultValue = 0.25, MinValue = 0.01, Step = 0.05)]
         public double RiskPercent { get; set; }
 
         [Parameter("Fixed Volume (Lots)", Group = "Position Sizing", DefaultValue = 0.1, MinValue = 0.01, Step = 0.01)]
         public double FixedVolumeLots { get; set; }
 
-        [Parameter("Max Spread (Pips)", Group = "Filters", DefaultValue = 3.0, MinValue = 0.0)]
+        [Parameter("Enable Session Filter", Group = "Filters", DefaultValue = false)]
+        public bool EnableSessionFilter { get; set; }
+
+        [Parameter("Start Hour (UTC)", Group = "Filters", DefaultValue = 7, MinValue = 0, MaxValue = 23)]
+        public int StartHourUtc { get; set; }
+
+        [Parameter("End Hour (UTC)", Group = "Filters", DefaultValue = 16, MinValue = 0, MaxValue = 23)]
+        public int EndHourUtc { get; set; }
+
+        [Parameter("Max Spread (Pips)", Group = "Filters", DefaultValue = 1.2, MinValue = 0.1, Step = 0.1)]
         public double MaxSpreadPips { get; set; }
 
-        [Parameter("Instance Label", Group = "Execution", DefaultValue = "Hull_LinReg")]
+        [Parameter("Instance Label", Group = "Execution", DefaultValue = "HULL_LINREG_v2")]
         public string InstanceLabel { get; set; }
 
         #endregion
 
-        #region Internal Fields
+        #region Private Fields
 
-        private LinearRegressionForecast _linRegForecast;
-        private MovingAverage _hullMa;
         private AverageTrueRange _atr;
+        private TradeType? _pendingSignal = null;
+        private int _pendingSignalBar = -1;
 
         #endregion
 
@@ -82,141 +92,175 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            _linRegForecast = Indicators.LinearRegressionForecast(Bars.ClosePrices, LinRegPeriod);
-            _hullMa = Indicators.MovingAverage(Bars.ClosePrices, HullPeriod, MovingAverageType.Hull);
             _atr = Indicators.AverageTrueRange(AtrLength, MovingAverageType.WilderSmoothing);
 
-            Print("Hull & LinReg Forecast initialized on {0} [{1}] (Fast LinReg: {2}, Slow Hull: {3}).", 
-                SymbolName, TimeFrame, LinRegPeriod, HullPeriod);
+            Print("[INIT] Hull & LinReg Forecast v2 | Asset: {0} | TF: {1} | TrailingMode: {2} | Risk: {3}% ({4})",
+                SymbolName, TimeFrame, TrailingType, RiskPercent, CapitalBase);
         }
 
         protected override void OnBar()
         {
-            // 1. Manage Trailing Stop on candle close
-            if (EnableTrailingStop)
+            // 1. Manage Dynamic ATR Trailing on Completed Bar Close
+            if (TrailingType == TrailingMode.AtrTrail)
             {
-                ManageAtrTrailingStop();
+                ManageDynamicAtrTrailing();
             }
 
-            // Require sufficient completed bars
-            int requiredBars = Math.Max(LinRegPeriod, Math.Max(HullPeriod, AtrLength)) + 2;
-            if (Bars.Count <= requiredBars)
-                return;
-
-            // Index 1 = Most recently closed candle, Index 2 = Candle before index 1
-            double fastPrev = _linRegForecast.Result.Last(2);
-            double fastCurr = _linRegForecast.Result.Last(1);
-            double slowPrev = _hullMa.Result.Last(2);
-            double slowCurr = _hullMa.Result.Last(1);
-
-            bool bullishCross = fastPrev <= slowPrev && fastCurr > slowCurr;
-            bool bearishCross = fastPrev >= slowPrev && fastCurr < slowCurr;
-
-            if (!bullishCross && !bearishCross)
-                return;
-
-            // 2. Check Time Session Filter
-            if (!IsWithinTradingSession())
+            // 2. Clear expired pending signals from previous bar
+            if (_pendingSignal.HasValue && _pendingSignalBar != Bars.Count - 1)
             {
-                Print("Signal detected ({0}), but trading is restricted outside session window ({1}:00 - {2}:00 UTC).", 
-                    bullishCross ? "Bullish Cross" : "Bearish Cross", StartHourUtc, EndHourUtc);
-                return;
+                Print("[SIGNAL EXPIRED] Pending {0} signal from bar #{1} expired unexecuted.", _pendingSignal, _pendingSignalBar);
+                _pendingSignal = null;
+                _pendingSignalBar = -1;
             }
 
-            // 3. Process Crossover Signals
-            if (bullishCross)
+            // 3. Ensure sufficient historical bars exist
+            int minRequiredBars = Math.Max(LinRegPeriod, HullPeriod) + 10;
+            if (Bars.Count <= minRequiredBars)
+                return;
+
+            // 4. Compute Fast LinReg Forecast & Slow Hull MA for bar t=1 and t=2
+            double linRegCurr = CalculateLinRegForecast(1, LinRegPeriod);
+            double linRegPrev = CalculateLinRegForecast(2, LinRegPeriod);
+
+            double hullCurr = CalculateHullMa(1, HullPeriod);
+            double hullPrev = CalculateHullMa(2, HullPeriod);
+
+            bool longCross = (linRegPrev <= hullPrev) && (linRegCurr > hullCurr);
+            bool shortCross = (linRegPrev >= hullPrev) && (linRegCurr < hullCurr);
+
+            if (longCross)
             {
-                HandleSignal(TradeType.Buy);
+                Print("[CROSSOVER DETECTED] BULLISH Cross at Bar #{0} | LinReg: {1:F5} > Hull: {2:F5}",
+                    Bars.Count - 1, linRegCurr, hullCurr);
+                SetPendingSignal(TradeType.Buy);
             }
-            else if (bearishCross)
+            else if (shortCross)
             {
-                HandleSignal(TradeType.Sell);
+                Print("[CROSSOVER DETECTED] BEARISH Cross at Bar #{0} | LinReg: {1:F5} < Hull: {2:F5}",
+                    Bars.Count - 1, linRegCurr, hullCurr);
+                SetPendingSignal(TradeType.Sell);
+            }
+
+            // 5. Attempt execution immediately if tick conditions permit
+            ProcessPendingSignal();
+        }
+
+        protected override void OnTick()
+        {
+            // Process pending signal if spread was too wide at bar open
+            if (_pendingSignal.HasValue)
+            {
+                ProcessPendingSignal();
             }
         }
 
         #endregion
 
-        #region Execution & Helper Methods
+        #region Core Execution Engine
 
-        private bool IsWithinTradingSession()
+        private void SetPendingSignal(TradeType type)
         {
-            if (!EnableSessionFilter)
-                return true;
-
-            int currentHour = Server.Time.Hour;
-            if (StartHourUtc <= EndHourUtc)
-            {
-                return currentHour >= StartHourUtc && currentHour < EndHourUtc;
-            }
-            else
-            {
-                return currentHour >= StartHourUtc || currentHour < EndHourUtc;
-            }
+            _pendingSignal = type;
+            _pendingSignalBar = Bars.Count - 1;
         }
 
-        private void HandleSignal(TradeType targetType)
+        private void ProcessPendingSignal()
         {
-            var activePosition = Positions.FirstOrDefault(p => p.Label == InstanceLabel && p.SymbolName == SymbolName);
+            if (!_pendingSignal.HasValue)
+                return;
 
-            // Reversal / Exit check
-            if (activePosition != null)
+            TradeType targetType = _pendingSignal.Value;
+
+            // Check Session Filter
+            if (!IsWithinTradingSession())
             {
-                if (activePosition.TradeType != targetType)
-                {
-                    if (ExitOnOppositeCross)
-                    {
-                        Print("Opposite cross detected. Closing active {0} position #{1}.", activePosition.TradeType, activePosition.Id);
-                        ClosePosition(activePosition);
-                    }
-                    else
-                    {
-                        return;
-                    }
-                }
-                else
-                {
-                    return;
-                }
+                Print("[EXECUTION BLOCKED] Signal {0} suppressed - outside trading session ({1}:00 UTC).",
+                    targetType, Server.Time.Hour);
+                _pendingSignal = null;
+                return;
             }
 
-            // Spread check
+            // Check Spread Condition
             double currentSpreadPips = Symbol.Spread / Symbol.PipSize;
             if (currentSpreadPips > MaxSpreadPips)
             {
-                Print("Execution suppressed for {0}: Current spread ({1:F2} pips) exceeds maximum allowed ({2:F2} pips).",
-                    targetType, currentSpreadPips, MaxSpreadPips);
+                // Wait for next tick within the same bar
                 return;
             }
 
-            // Calculate SL distance based on ATR
-            double atrVal = _atr.Result.Last(1);
-            double slDistancePips = (atrVal * AtrSlMultiplier) / Symbol.PipSize;
+            // Handle Active Positions / Atomic Reversals
+            var activePosition = Positions.FirstOrDefault(p => p.Label == InstanceLabel && p.SymbolName == SymbolName);
+            if (activePosition != null)
+            {
+                if (activePosition.TradeType == targetType)
+                {
+                    _pendingSignal = null;
+                    return;
+                }
 
+                Print("[REVERSAL] Closing existing {0} position #{1} prior to opening {2}.",
+                    activePosition.TradeType, activePosition.Id, targetType);
+
+                var closeResult = ClosePosition(activePosition);
+                if (!closeResult.IsSuccessful)
+                {
+                    Print("[ERROR] Failed to close position #{0} for reversal. Reason: {1}",
+                        activePosition.Id, closeResult.Error);
+                    return; // Will retry on next tick
+                }
+            }
+
+            // Calculate SL Distance
+            double slDistancePips = GetInitialStopLossPips();
             if (slDistancePips <= 0)
             {
-                Print("ERROR: Calculated SL distance is invalid ({0:F2} pips). Order cancelled.", slDistancePips);
+                Print("[ERROR] Invalid SL distance ({0:F2} pips). Signal aborted.", slDistancePips);
+                _pendingSignal = null;
                 return;
             }
 
+            // Calculate Volume
             double volumeInUnits = CalculateVolume(slDistancePips);
-
             if (volumeInUnits < Symbol.VolumeInUnitsMin)
             {
-                Print("Calculated volume ({0}) is below symbol minimum ({1}). Order aborted.", volumeInUnits, Symbol.VolumeInUnitsMin);
+                Print("[ERROR] Calculated volume ({0}) below symbol minimum ({1}). Order aborted.",
+                    volumeInUnits, Symbol.VolumeInUnitsMin);
+                _pendingSignal = null;
                 return;
             }
 
-            // Place Order
-            var result = ExecuteMarketOrder(targetType, SymbolName, volumeInUnits, InstanceLabel, slDistancePips, null);
+            // Native Trailing Flag (True only for PipsTrail mode)
+            bool useNativeTsl = (TrailingType == TrailingMode.PipsTrail);
+
+            // Execute Market Order
+            var result = ExecuteMarketOrder(targetType, SymbolName, volumeInUnits, InstanceLabel, slDistancePips, null, null, useNativeTsl);
+            
             if (result.IsSuccessful)
             {
-                Print("SUCCESS: Opened {0} order #{1} | Volume: {2} units | SL: {3:F1} pips.", 
-                    targetType, result.Position.Id, volumeInUnits, slDistancePips);
+                Print("[ORDER SUCCESS] #{0} {1} | Vol: {2} units | SL: {3:F1} pips | Native TSL: {4}",
+                    result.Position.Id, targetType, volumeInUnits, slDistancePips, useNativeTsl);
+                _pendingSignal = null;
             }
             else
             {
-                Print("ERROR: Failed to open {0} order. Reason: {1}", targetType, result.Error);
+                Print("[ORDER FAILED] Reason: {0}", result.Error);
             }
+        }
+
+        private double GetInitialStopLossPips()
+        {
+            if (TrailingType == TrailingMode.PipsTrail)
+            {
+                return PipsStopLoss;
+            }
+
+            // AtrTrail or Disabled with ATR
+            double atrVal = _atr.Result.Last(1);
+            if (double.IsNaN(atrVal) || atrVal <= 0)
+                return PipsStopLoss;
+
+            return (atrVal * AtrSlMultiplier) / Symbol.PipSize;
         }
 
         private double CalculateVolume(double slDistancePips)
@@ -245,31 +289,141 @@ namespace cAlgo.Robots
             return normalizedVolume;
         }
 
-        private void ManageAtrTrailingStop()
+        private void ManageDynamicAtrTrailing()
         {
             var position = Positions.FirstOrDefault(p => p.Label == InstanceLabel && p.SymbolName == SymbolName);
             if (position == null)
                 return;
 
             double atrVal = _atr.Result.Last(1);
-            double trailingDistance = atrVal * AtrSlMultiplier;
+            if (double.IsNaN(atrVal) || atrVal <= 0)
+                return;
+
+            double trailDistance = atrVal * AtrSlMultiplier;
+            double minStepInPrice = AtrStepPips * Symbol.PipSize;
 
             if (position.TradeType == TradeType.Buy)
             {
-                double targetSl = Bars.ClosePrices.Last(1) - trailingDistance;
-                if (!position.StopLoss.HasValue || targetSl > position.StopLoss.Value + (Symbol.PipSize * 0.1))
+                double currentClose = Bars.ClosePrices.Last(1);
+                double targetSl = currentClose - trailDistance;
+
+                if (!position.StopLoss.HasValue || (targetSl - position.StopLoss.Value >= minStepInPrice))
                 {
                     ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
+                    Print("[DYNAMIC ATR TRAIL] Updated Buy SL to {0:F5} (Step >= {1:F1} pips)", targetSl, AtrStepPips);
                 }
             }
             else if (position.TradeType == TradeType.Sell)
             {
-                double targetSl = Bars.ClosePrices.Last(1) + trailingDistance;
-                if (!position.StopLoss.HasValue || targetSl < position.StopLoss.Value - (Symbol.PipSize * 0.1))
+                double currentClose = Bars.ClosePrices.Last(1);
+                double targetSl = currentClose + trailDistance;
+
+                if (!position.StopLoss.HasValue || (position.StopLoss.Value - targetSl >= minStepInPrice))
                 {
                     ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
+                    Print("[DYNAMIC ATR TRAIL] Updated Sell SL to {0:F5} (Step >= {1:F1} pips)", targetSl, AtrStepPips);
                 }
             }
+        }
+
+        private bool IsWithinTradingSession()
+        {
+            if (!EnableSessionFilter)
+                return true;
+
+            int currentHour = Server.Time.Hour;
+            if (StartHourUtc <= EndHourUtc)
+            {
+                return currentHour >= StartHourUtc && currentHour < EndHourUtc;
+            }
+            else
+            {
+                return currentHour >= StartHourUtc || currentHour < EndHourUtc;
+            }
+        }
+
+        #endregion
+
+        #region Custom Indicator Engine (Hull MA & LinReg Forecast)
+
+        private double CalculateLinRegForecast(int shift, int length)
+        {
+            if (Bars.Count < shift + length)
+                return Bars.ClosePrices.Last(shift);
+
+            double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+
+            for (int i = 0; i < length; i++)
+            {
+                double x = i;
+                double y = Bars.ClosePrices.Last(shift + length - 1 - i);
+
+                sumX += x;
+                sumY += y;
+                sumXY += x * y;
+                sumX2 += x * x;
+            }
+
+            double divisor = (length * sumX2 - sumX * sumX);
+            if (Math.Abs(divisor) < 1e-9)
+                return Bars.ClosePrices.Last(shift);
+
+            double slope = (length * sumXY - sumX * sumY) / divisor;
+            double intercept = (sumY - slope * sumX) / length;
+
+            return intercept + slope * (length - 1);
+        }
+
+        private double CalculateHullMa(int shift, int length)
+        {
+            int halfLength = length / 2;
+            int sqrtLength = (int)Math.Sqrt(length);
+
+            if (halfLength < 1) halfLength = 1;
+            if (sqrtLength < 1) sqrtLength = 1;
+
+            if (Bars.Count < shift + length + sqrtLength)
+                return Bars.ClosePrices.Last(shift);
+
+            double[] rawHmaSeries = new double[sqrtLength];
+
+            for (int j = 0; j < sqrtLength; j++)
+            {
+                int currentShift = shift + j;
+                double wmaHalf = CalculateWma(currentShift, halfLength);
+                double wmaFull = CalculateWma(currentShift, length);
+
+                rawHmaSeries[j] = (2.0 * wmaHalf) - wmaFull;
+            }
+
+            double weightedSum = 0;
+            double weightSum = 0;
+
+            for (int k = 0; k < sqrtLength; k++)
+            {
+                double weight = sqrtLength - k;
+                weightedSum += rawHmaSeries[k] * weight;
+                weightSum += weight;
+            }
+
+            return weightSum > 0 ? weightedSum / weightSum : Bars.ClosePrices.Last(shift);
+        }
+
+        private double CalculateWma(int shift, int length)
+        {
+            double weightedSum = 0;
+            double weightSum = 0;
+
+            for (int i = 0; i < length; i++)
+            {
+                double weight = length - i;
+                double price = Bars.ClosePrices.Last(shift + i);
+
+                weightedSum += price * weight;
+                weightSum += weight;
+            }
+
+            return weightSum > 0 ? weightedSum / weightSum : Bars.ClosePrices.Last(shift);
         }
 
         #endregion
