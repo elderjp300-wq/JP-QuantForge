@@ -30,17 +30,14 @@ namespace cAlgo.Robots
     {
         #region Strategy Parameters
 
-        [Parameter("Fast LinReg Period", Group = "Strategy Indicators", DefaultValue = 7, MinValue = 2)]
-        public int FastPeriod { get; set; }
+        [Parameter("Price Source", Group = "LRI Indicator Settings")]
+        public DataSeries Source { get; set; }
 
-        [Parameter("Slow LinReg Period", Group = "Strategy Indicators", DefaultValue = 21, MinValue = 2)]
-        public int SlowPeriod { get; set; }
+        [Parameter("LRI Length", Group = "LRI Indicator Settings", DefaultValue = 9, MinValue = 2)]
+        public int LriLength { get; set; }
 
         [Parameter("Trailing Stop Mode", Group = "Trailing & Exits", DefaultValue = TrailingMode.AtrTrail)]
         public TrailingMode TrailingType { get; set; }
-
-        [Parameter("Pips SL / Trailing Distance", Group = "Trailing & Exits", DefaultValue = 20.0, MinValue = 1.0, Step = 0.5)]
-        public double PipsStopLoss { get; set; }
 
         [Parameter("ATR Length", Group = "Trailing & Exits", DefaultValue = 14, MinValue = 1)]
         public int AtrLength { get; set; }
@@ -50,6 +47,9 @@ namespace cAlgo.Robots
 
         [Parameter("ATR Step Filter (Pips)", Group = "Trailing & Exits", DefaultValue = 0.5, MinValue = 0.1, Step = 0.1)]
         public double AtrStepPips { get; set; }
+
+        [Parameter("Fixed SL / Trailing Pips", Group = "Trailing & Exits", DefaultValue = 20.0, MinValue = 1.0, Step = 0.5)]
+        public double PipsStopLoss { get; set; }
 
         [Parameter("Sizing Mode", Group = "Position Sizing", DefaultValue = SizingMode.RiskPercentage)]
         public SizingMode Sizing { get; set; }
@@ -63,14 +63,14 @@ namespace cAlgo.Robots
         [Parameter("Fixed Volume (Lots)", Group = "Position Sizing", DefaultValue = 0.1, MinValue = 0.01, Step = 0.01)]
         public double FixedVolumeLots { get; set; }
 
-        [Parameter("Enable Session Filter", Group = "Filters", DefaultValue = false)]
+        [Parameter("Enable Session Filter", Group = "Session Filter (UTC+1)", DefaultValue = false)]
         public bool EnableSessionFilter { get; set; }
 
-        [Parameter("Start Hour (UTC)", Group = "Filters", DefaultValue = 7, MinValue = 0, MaxValue = 23)]
-        public int StartHourUtc { get; set; }
+        [Parameter("Start Hour (UTC+1)", Group = "Session Filter (UTC+1)", DefaultValue = 8, MinValue = 0, MaxValue = 23)]
+        public int StartHourUtc1 { get; set; }
 
-        [Parameter("End Hour (UTC)", Group = "Filters", DefaultValue = 16, MinValue = 0, MaxValue = 23)]
-        public int EndHourUtc { get; set; }
+        [Parameter("End Hour (UTC+1)", Group = "Session Filter (UTC+1)", DefaultValue = 17, MinValue = 0, MaxValue = 23)]
+        public int EndHourUtc1 { get; set; }
 
         [Parameter("Max Spread (Pips)", Group = "Filters", DefaultValue = 1.2, MinValue = 0.1, Step = 0.1)]
         public double MaxSpreadPips { get; set; }
@@ -82,7 +82,9 @@ namespace cAlgo.Robots
 
         #region Private Fields
 
+        private LinearRegressionIntercept _lri;
         private AverageTrueRange _atr;
+        private DataSeries _effectiveSource;
         private TradeType? _pendingSignal = null;
         private int _pendingSignalBar = -1;
 
@@ -92,10 +94,12 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
+            _effectiveSource = Source ?? Bars.ClosePrices;
+            _lri = Indicators.LinearRegressionIntercept(_effectiveSource, LriLength);
             _atr = Indicators.AverageTrueRange(AtrLength, MovingAverageType.WilderSmoothing);
 
-            Print("[INIT] LinReg Intercept v6 | Asset: {0} | TF: {1} | TrailingMode: {2} | Risk: {3}% ({4})",
-                SymbolName, TimeFrame, TrailingType, RiskPercent, CapitalBase);
+            Print("[INIT] LinReg Intercept v6 | Asset: {0} | TF: {1} | LRI Length: {2} | TrailingMode: {3} | Risk: {4}%",
+                SymbolName, TimeFrame, LriLength, TrailingType, RiskPercent);
         }
 
         protected override void OnBar()
@@ -115,34 +119,33 @@ namespace cAlgo.Robots
             }
 
             // 3. Ensure sufficient historical bars exist
-            int minRequiredBars = Math.Max(FastPeriod, SlowPeriod) + 10;
-            if (Bars.Count <= minRequiredBars)
+            if (Bars.Count <= LriLength + 5)
                 return;
 
-            // 4. Compute Fast & Slow LinReg Intercepts for bar t=1 and t=2
-            double fastCurr = CalculateLinRegIntercept(1, FastPeriod);
-            double fastPrev = CalculateLinRegIntercept(2, FastPeriod);
+            // 4. Evaluate Price Close vs. LRI Crossover on completed bars
+            double prevClose = _effectiveSource.Last(2);
+            double currClose = _effectiveSource.Last(1);
 
-            double slowCurr = CalculateLinRegIntercept(1, SlowPeriod);
-            double slowPrev = CalculateLinRegIntercept(2, SlowPeriod);
+            double prevLri = _lri.Result.Last(2);
+            double currLri = _lri.Result.Last(1);
 
-            bool longCross = (fastPrev <= slowPrev) && (fastCurr > slowCurr);
-            bool shortCross = (fastPrev >= slowPrev) && (fastCurr < slowCurr);
+            bool buySignal = (prevClose <= prevLri) && (currClose > currLri);
+            bool sellSignal = (prevClose >= prevLri) && (currClose < currLri);
 
-            if (longCross)
+            if (buySignal)
             {
-                Print("[CROSSOVER DETECTED] BULLISH Cross at Bar #{0} | Fast Intercept: {1:F5} > Slow Intercept: {2:F5}",
-                    Bars.Count - 1, fastCurr, slowCurr);
+                Print("[CROSSOVER DETECTED] BULLISH Close Cross | Bar #{0} | PrevClose: {1:F5} <= PrevLRI: {2:F5} | CurrClose: {3:F5} > CurrLRI: {4:F5}",
+                    Bars.Count - 1, prevClose, prevLri, currClose, currLri);
                 SetPendingSignal(TradeType.Buy);
             }
-            else if (shortCross)
+            else if (sellSignal)
             {
-                Print("[CROSSOVER DETECTED] BEARISH Cross at Bar #{0} | Fast Intercept: {1:F5} < Slow Intercept: {2:F5}",
-                    Bars.Count - 1, fastCurr, slowCurr);
+                Print("[CROSSOVER DETECTED] BEARISH Close Cross | Bar #{0} | PrevClose: {1:F5} >= PrevLRI: {2:F5} | CurrClose: {3:F5} < CurrLRI: {4:F5}",
+                    Bars.Count - 1, prevClose, prevLri, currClose, currLri);
                 SetPendingSignal(TradeType.Sell);
             }
 
-            // 5. Attempt execution immediately if tick conditions permit
+            // 5. Attempt execution immediately
             ProcessPendingSignal();
         }
 
@@ -172,11 +175,12 @@ namespace cAlgo.Robots
 
             TradeType targetType = _pendingSignal.Value;
 
-            // Check Session Filter
+            // Check Session Filter (UTC+1)
             if (!IsWithinTradingSession())
             {
-                Print("[EXECUTION BLOCKED] Signal {0} suppressed - outside trading session ({1}:00 UTC).",
-                    targetType, Server.Time.Hour);
+                int localHour = Server.Time.AddHours(1).Hour;
+                Print("[EXECUTION BLOCKED] Signal {0} suppressed - outside trading session window ({1}:00 UTC+1).",
+                    targetType, localHour);
                 _pendingSignal = null;
                 return;
             }
@@ -185,8 +189,7 @@ namespace cAlgo.Robots
             double currentSpreadPips = Symbol.Spread / Symbol.PipSize;
             if (currentSpreadPips > MaxSpreadPips)
             {
-                // Wait for next tick within the same bar
-                return;
+                return; // Wait for next tick within the same bar
             }
 
             // Handle Active Positions / Atomic Reversals
@@ -207,7 +210,7 @@ namespace cAlgo.Robots
                 {
                     Print("[ERROR] Failed to close position #{0} for reversal. Reason: {1}",
                         activePosition.Id, closeResult.Error);
-                    return; // Will retry on next tick
+                    return; // Retry on next tick
                 }
             }
 
@@ -233,12 +236,12 @@ namespace cAlgo.Robots
             // Native Trailing Flag (True only for PipsTrail mode)
             bool useNativeTsl = (TrailingType == TrailingMode.PipsTrail);
 
-            // Execute Market Order
+            // Execute Market Order (No Take Profit as per strategy spec)
             var result = ExecuteMarketOrder(targetType, SymbolName, volumeInUnits, InstanceLabel, slDistancePips, null, null, useNativeTsl);
-            
+
             if (result.IsSuccessful)
             {
-                Print("[ORDER SUCCESS] #{0} {1} | Vol: {2} units | SL: {3:F1} pips | Native TSL: {4}",
+                Print("[ORDER SUCCESS] #{0} {1} | Vol: {2} units | SL: {3:F1} pips | TP: None | Native TSL: {4}",
                     result.Position.Id, targetType, volumeInUnits, slDistancePips, useNativeTsl);
                 _pendingSignal = null;
             }
@@ -255,7 +258,6 @@ namespace cAlgo.Robots
                 return PipsStopLoss;
             }
 
-            // AtrTrail or Disabled with ATR
             double atrVal = _atr.Result.Last(1);
             if (double.IsNaN(atrVal) || atrVal <= 0)
                 return PipsStopLoss;
@@ -304,24 +306,24 @@ namespace cAlgo.Robots
 
             if (position.TradeType == TradeType.Buy)
             {
-                double currentClose = Bars.ClosePrices.Last(1);
+                double currentClose = _effectiveSource.Last(1);
                 double targetSl = currentClose - trailDistance;
 
                 if (!position.StopLoss.HasValue || (targetSl - position.StopLoss.Value >= minStepInPrice))
                 {
                     ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
-                    Print("[DYNAMIC ATR TRAIL] Updated Buy SL to {0:F5} (Step >= {1:F1} pips)", targetSl, AtrStepPips);
+                    Print("[DYNAMIC ATR TRAIL] Updated Buy SL to {0:F5}", targetSl);
                 }
             }
             else if (position.TradeType == TradeType.Sell)
             {
-                double currentClose = Bars.ClosePrices.Last(1);
+                double currentClose = _effectiveSource.Last(1);
                 double targetSl = currentClose + trailDistance;
 
                 if (!position.StopLoss.HasValue || (position.StopLoss.Value - targetSl >= minStepInPrice))
                 {
                     ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
-                    Print("[DYNAMIC ATR TRAIL] Updated Sell SL to {0:F5} (Step >= {1:F1} pips)", targetSl, AtrStepPips);
+                    Print("[DYNAMIC ATR TRAIL] Updated Sell SL to {0:F5}", targetSl);
                 }
             }
         }
@@ -331,47 +333,16 @@ namespace cAlgo.Robots
             if (!EnableSessionFilter)
                 return true;
 
-            int currentHour = Server.Time.Hour;
-            if (StartHourUtc <= EndHourUtc)
+            int currentHourUtc1 = Server.Time.AddHours(1).Hour;
+
+            if (StartHourUtc1 <= EndHourUtc1)
             {
-                return currentHour >= StartHourUtc && currentHour < EndHourUtc;
+                return currentHourUtc1 >= StartHourUtc1 && currentHourUtc1 < EndHourUtc1;
             }
             else
             {
-                return currentHour >= StartHourUtc || currentHour < EndHourUtc;
+                return currentHourUtc1 >= StartHourUtc1 || currentHourUtc1 < EndHourUtc1;
             }
-        }
-
-        #endregion
-
-        #region Custom Indicator Engine (Linear Regression Intercept)
-
-        private double CalculateLinRegIntercept(int shift, int length)
-        {
-            if (Bars.Count < shift + length)
-                return Bars.ClosePrices.Last(shift);
-
-            double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
-
-            for (int i = 0; i < length; i++)
-            {
-                double x = i;
-                double y = Bars.ClosePrices.Last(shift + length - 1 - i);
-
-                sumX += x;
-                sumY += y;
-                sumXY += x * y;
-                sumX2 += x * x;
-            }
-
-            double divisor = (length * sumX2 - sumX * sumX);
-            if (Math.Abs(divisor) < 1e-9)
-                return Bars.ClosePrices.Last(shift);
-
-            double slope = (length * sumXY - sumX * sumY) / divisor;
-            double intercept = (sumY - slope * sumX) / length;
-
-            return intercept;
         }
 
         #endregion
