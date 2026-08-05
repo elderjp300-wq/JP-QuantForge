@@ -6,6 +6,13 @@ using cAlgo.API.Internals;
 
 namespace cAlgo.Robots
 {
+    public enum TrailingMode
+    {
+        Disabled,
+        AtrTrail,
+        PipsTrail
+    }
+
     public enum SizingMode
     {
         FixedLots,
@@ -26,14 +33,32 @@ namespace cAlgo.Robots
         [Parameter("Momentum Length", Group = "Momentum Strategy", DefaultValue = 12, MinValue = 1)]
         public int MomentumLength { get; set; }
 
-        [Parameter("ATR Length", Group = "ATR Trailing Stop", DefaultValue = 14, MinValue = 1)]
+        [Parameter("Trailing Mode", Group = "Trailing Stop Engine", DefaultValue = TrailingMode.AtrTrail)]
+        public TrailingMode TrailingType { get; set; }
+
+        [Parameter("ATR Length", Group = "Trailing Stop Engine", DefaultValue = 14, MinValue = 1)]
         public int AtrLength { get; set; }
 
-        [Parameter("ATR Multiplier", Group = "ATR Trailing Stop", DefaultValue = 2.0, MinValue = 0.1, Step = 0.1)]
+        [Parameter("ATR Multiplier", Group = "Trailing Stop Engine", DefaultValue = 2.0, MinValue = 0.1, Step = 0.1)]
         public double AtrMultiplier { get; set; }
 
-        [Parameter("ATR Step Filter (Pips)", Group = "ATR Trailing Stop", DefaultValue = 0.5, MinValue = 0.1, Step = 0.1)]
+        [Parameter("ATR Step Filter (Pips)", Group = "Trailing Stop Engine", DefaultValue = 0.5, MinValue = 0.1, Step = 0.1)]
         public double AtrStepPips { get; set; }
+
+        [Parameter("Fixed Trailing Pips", Group = "Trailing Stop Engine", DefaultValue = 20.0, MinValue = 1.0, Step = 0.5)]
+        public double TrailingPips { get; set; }
+
+        [Parameter("Trailing Step Pips", Group = "Trailing Stop Engine", DefaultValue = 1.0, MinValue = 0.1, Step = 0.1)]
+        public double TrailingStopStepPips { get; set; }
+
+        [Parameter("Enable Session Filter", Group = "Session Filter (UTC+1 WAT)", DefaultValue = false)]
+        public bool UseSessionFilter { get; set; }
+
+        [Parameter("Start Hour (UTC+1)", Group = "Session Filter (UTC+1 WAT)", DefaultValue = 8, MinValue = 0, MaxValue = 23)]
+        public int StartHour { get; set; }
+
+        [Parameter("End Hour (UTC+1)", Group = "Session Filter (UTC+1 WAT)", DefaultValue = 20, MinValue = 0, MaxValue = 23)]
+        public int EndHour { get; set; }
 
         [Parameter("Sizing Mode", Group = "Risk Management", DefaultValue = SizingMode.RiskPercentage)]
         public SizingMode Sizing { get; set; }
@@ -60,6 +85,7 @@ namespace cAlgo.Robots
         private AverageTrueRange _atr;
         private TradeType? _pendingSignal = null;
         private int _pendingSignalBar = -1;
+        private int _stoppedOutDirection = 0; // 1 = Buy stopped out, -1 = Sell stopped out
 
         #endregion
 
@@ -67,27 +93,41 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            // Wilder's Smoothing matches TradingView ta.atr()
             _atr = Indicators.AverageTrueRange(AtrLength, MovingAverageType.WilderSmoothing);
+            Positions.Closed += OnPositionsClosed;
 
-            Print("[INIT] Momentum V6 initialized successfully | Symbol: {0} | TF: {1} | Mom Length: {2} | ATR Length: {3}",
-                SymbolName, TimeFrame, MomentumLength, AtrLength);
+            Print("[INIT] Momentum V6 initialized | Symbol: {0} | TF: {1} | Mom Length: {2} | Trailing Mode: {3}",
+                SymbolName, TimeFrame, MomentumLength, TrailingType);
+        }
+
+        private void OnPositionsClosed(PositionClosedEventArgs args)
+        {
+            var pos = args.Position;
+            if (pos.Label == InstanceLabel && pos.SymbolName == SymbolName)
+            {
+                if (args.Reason == PositionCloseReason.StopLoss || args.Reason == PositionCloseReason.TakeProfit)
+                {
+                    _stoppedOutDirection = pos.TradeType == TradeType.Buy ? 1 : -1;
+                    Print("[SMART RE-ENTRY GUARD] Position #{0} ({1}) closed by SL/TP. Lockout activated for {2} until momentum resets.",
+                        pos.Id, pos.TradeType, pos.TradeType);
+                }
+            }
         }
 
         protected override void OnBar()
         {
-            // 1. Manage ATR Trailing Stop on Completed Candle Close
-            ManageAtrTrailingStop();
+            // 1. Manage Trailing Stop on Completed Candle Close
+            ManageTrailingStop();
 
             // 2. Clear expired pending signals from previous bar
             if (_pendingSignal.HasValue && _pendingSignalBar != Bars.Count - 1)
             {
-                Print("[SIGNAL EXPIRED] Pending {0} signal from bar #{1} expired unexecuted.", _pendingSignal, _pendingSignalBar);
+                Print("[SIGNAL EXPIRED] Pending {0} signal from bar #{1} expired.", _pendingSignal, _pendingSignalBar);
                 _pendingSignal = null;
                 _pendingSignalBar = -1;
             }
 
-            // 3. Require enough completed history for lookback calculations
+            // 3. Check history depth
             if (Bars.Count <= MomentumLength + 2)
                 return;
 
@@ -99,29 +139,61 @@ namespace cAlgo.Robots
             bool longCondition = currentMom > 0.0 && currentMom > previousMom;
             bool shortCondition = currentMom < 0.0 && currentMom < previousMom;
 
+            // Smart Re-Entry Guard Reset
+            if (_stoppedOutDirection == 1 && !longCondition)
+            {
+                Print("[SMART RE-ENTRY GUARD] Long momentum reset detected. Re-entry unlocked.");
+                _stoppedOutDirection = 0;
+            }
+            if (_stoppedOutDirection == -1 && !shortCondition)
+            {
+                Print("[SMART RE-ENTRY GUARD] Short momentum reset detected. Re-entry unlocked.");
+                _stoppedOutDirection = 0;
+            }
+
+            // Check Session Filter (UTC+1 WAT)
+            if (!IsWithinTradingSession())
+            {
+                return;
+            }
+
             var activePosition = GetActivePosition();
             int currentPositionState = activePosition == null ? 0 : (activePosition.TradeType == TradeType.Buy ? 1 : -1);
 
+            // Buy Signal Trigger
             if (longCondition && currentPositionState <= 0)
             {
-                Print("[SIGNAL DETECTED] BULLISH Momentum | Bar #{0} | CurrentMom: {1:F5} > PrevMom: {2:F5}",
-                    Bars.Count - 1, currentMom, previousMom);
-                SetPendingSignal(TradeType.Buy);
+                if (_stoppedOutDirection == 1)
+                {
+                    Print("[SMART RE-ENTRY GUARD] Buy signal suppressed - waiting for momentum reset after previous stop-out.");
+                }
+                else
+                {
+                    Print("[SIGNAL DETECTED] BULLISH Momentum | Bar #{0} | CurrentMom: {1:F5} > PrevMom: {2:F5}",
+                        Bars.Count - 1, currentMom, previousMom);
+                    SetPendingSignal(TradeType.Buy);
+                }
             }
+            // Sell Signal Trigger
             else if (shortCondition && currentPositionState >= 0)
             {
-                Print("[SIGNAL DETECTED] BEARISH Momentum | Bar #{0} | CurrentMom: {1:F5} < PrevMom: {2:F5}",
-                    Bars.Count - 1, currentMom, previousMom);
-                SetPendingSignal(TradeType.Sell);
+                if (_stoppedOutDirection == -1)
+                {
+                    Print("[SMART RE-ENTRY GUARD] Sell signal suppressed - waiting for momentum reset after previous stop-out.");
+                }
+                else
+                {
+                    Print("[SIGNAL DETECTED] BEARISH Momentum | Bar #{0} | CurrentMom: {1:F5} < PrevMom: {2:F5}",
+                        Bars.Count - 1, currentMom, previousMom);
+                    SetPendingSignal(TradeType.Sell);
+                }
             }
 
-            // Attempt execution immediately on bar close
             ProcessPendingSignal();
         }
 
         protected override void OnTick()
         {
-            // Process pending signal if spread was too wide at bar open
             if (_pendingSignal.HasValue)
             {
                 ProcessPendingSignal();
@@ -131,6 +203,23 @@ namespace cAlgo.Robots
         #endregion
 
         #region Core Execution Engine
+
+        private bool IsWithinTradingSession()
+        {
+            if (!UseSessionFilter)
+                return true;
+
+            int currentWatHour = Server.Time.AddHours(1).Hour;
+
+            if (StartHour <= EndHour)
+            {
+                return currentWatHour >= StartHour && currentWatHour < EndHour;
+            }
+            else
+            {
+                return currentWatHour >= StartHour || currentWatHour < EndHour;
+            }
+        }
 
         private Position GetActivePosition()
         {
@@ -145,7 +234,6 @@ namespace cAlgo.Robots
 
         private double CalculateMomentum(int barIndex)
         {
-            // Close[barIndex] - Close[barIndex + MomentumLength]
             return Bars.ClosePrices.Last(barIndex) - Bars.ClosePrices.Last(barIndex + MomentumLength);
         }
 
@@ -160,7 +248,7 @@ namespace cAlgo.Robots
             double currentSpreadPips = Symbol.Spread / Symbol.PipSize;
             if (currentSpreadPips > MaxSpreadPips)
             {
-                return; // Retries on next tick within the same bar
+                return; // Retry on next tick
             }
 
             // Handle Active Positions / Atomic Reversals
@@ -169,7 +257,6 @@ namespace cAlgo.Robots
             {
                 if (activePosition.TradeType == targetType)
                 {
-                    // Already holding position in target direction
                     _pendingSignal = null;
                     return;
                 }
@@ -212,14 +299,28 @@ namespace cAlgo.Robots
                 return;
             }
 
-            // Execute Market Order with initial ATR Stop Loss
-            var result = ExecuteMarketOrder(targetType, SymbolName, volumeInUnits, InstanceLabel, slDistancePips, null);
+            // Determine initial stop loss pips based on TrailingType
+            double? initialSlPips = null;
+            if (TrailingType == TrailingMode.AtrTrail)
+            {
+                initialSlPips = slDistancePips;
+            }
+            else if (TrailingType == TrailingMode.PipsTrail)
+            {
+                initialSlPips = TrailingPips;
+            }
+
+            // Execute Market Order
+            var result = ExecuteMarketOrder(targetType, SymbolName, volumeInUnits, InstanceLabel, initialSlPips, null);
 
             if (result.IsSuccessful)
             {
-                Print("[ORDER SUCCESS] #{0} {1} | Vol: {2} units | SL: {3:F1} pips | TP: None",
-                    result.Position.Id, targetType, volumeInUnits, slDistancePips);
+                Print("[ORDER SUCCESS] #{0} {1} | Vol: {2} units | SL: {3} pips | Mode: {4}",
+                    result.Position.Id, targetType, volumeInUnits,
+                    initialSlPips.HasValue ? initialSlPips.Value.ToString("F1") : "None", TrailingType);
+
                 _pendingSignal = null;
+                _stoppedOutDirection = 0; // Clear lockout on fresh fill
             }
             else
             {
@@ -253,39 +354,70 @@ namespace cAlgo.Robots
             return normalizedVolume;
         }
 
-        private void ManageAtrTrailingStop()
+        private void ManageTrailingStop()
         {
             var position = GetActivePosition();
-            if (position == null)
+            if (position == null || TrailingType == TrailingMode.Disabled)
                 return;
 
-            double atrVal = _atr.Result.Last(1);
-            if (double.IsNaN(atrVal) || atrVal <= 0)
-                return;
-
-            double trailingDistance = atrVal * AtrMultiplier;
-            double minStepInPrice = AtrStepPips * Symbol.PipSize;
-
-            if (position.TradeType == TradeType.Buy)
+            if (TrailingType == TrailingMode.AtrTrail)
             {
-                double currentClose = Bars.ClosePrices.Last(1);
-                double targetSl = currentClose - trailingDistance;
+                double atrVal = _atr.Result.Last(1);
+                if (double.IsNaN(atrVal) || atrVal <= 0)
+                    return;
 
-                if (!position.StopLoss.HasValue || (targetSl - position.StopLoss.Value >= minStepInPrice))
+                double trailingDistance = atrVal * AtrMultiplier;
+                double minStepInPrice = AtrStepPips * Symbol.PipSize;
+
+                if (position.TradeType == TradeType.Buy)
                 {
-                    ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
-                    Print("[DYNAMIC ATR TRAIL] Updated Buy SL to {0:F5}", targetSl);
+                    double currentClose = Bars.ClosePrices.Last(1);
+                    double targetSl = currentClose - trailingDistance;
+
+                    if (!position.StopLoss.HasValue || (targetSl - position.StopLoss.Value >= minStepInPrice))
+                    {
+                        ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
+                        Print("[DYNAMIC ATR TRAIL] Updated Buy SL to {0:F5}", targetSl);
+                    }
+                }
+                else if (position.TradeType == TradeType.Sell)
+                {
+                    double currentClose = Bars.ClosePrices.Last(1);
+                    double targetSl = currentClose + trailingDistance;
+
+                    if (!position.StopLoss.HasValue || (position.StopLoss.Value - targetSl >= minStepInPrice))
+                    {
+                        ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
+                        Print("[DYNAMIC ATR TRAIL] Updated Sell SL to {0:F5}", targetSl);
+                    }
                 }
             }
-            else if (position.TradeType == TradeType.Sell)
+            else if (TrailingType == TrailingMode.PipsTrail)
             {
-                double currentClose = Bars.ClosePrices.Last(1);
-                double targetSl = currentClose + trailingDistance;
+                double minStepInPrice = TrailingStopStepPips * Symbol.PipSize;
+                double trailDistanceInPrice = TrailingPips * Symbol.PipSize;
 
-                if (!position.StopLoss.HasValue || (position.StopLoss.Value - targetSl >= minStepInPrice))
+                if (position.TradeType == TradeType.Buy)
                 {
-                    ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
-                    Print("[DYNAMIC ATR TRAIL] Updated Sell SL to {0:F5}", targetSl);
+                    double currentClose = Bars.ClosePrices.Last(1);
+                    double targetSl = currentClose - trailDistanceInPrice;
+
+                    if (!position.StopLoss.HasValue || (targetSl - position.StopLoss.Value >= minStepInPrice))
+                    {
+                        ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
+                        Print("[FIXED PIPS TRAIL] Updated Buy SL to {0:F5}", targetSl);
+                    }
+                }
+                else if (position.TradeType == TradeType.Sell)
+                {
+                    double currentClose = Bars.ClosePrices.Last(1);
+                    double targetSl = currentClose + trailDistanceInPrice;
+
+                    if (!position.StopLoss.HasValue || (position.StopLoss.Value - targetSl >= minStepInPrice))
+                    {
+                        ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
+                        Print("[FIXED PIPS TRAIL] Updated Sell SL to {0:F5}", targetSl);
+                    }
                 }
             }
         }
