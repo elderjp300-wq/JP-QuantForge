@@ -32,6 +32,9 @@ namespace cAlgo.Robots
         [Parameter("ATR Multiplier", Group = "ATR Trailing Stop", DefaultValue = 2.0, MinValue = 0.1, Step = 0.1)]
         public double AtrMultiplier { get; set; }
 
+        [Parameter("ATR Step Filter (Pips)", Group = "ATR Trailing Stop", DefaultValue = 0.5, MinValue = 0.1, Step = 0.1)]
+        public double AtrStepPips { get; set; }
+
         [Parameter("Sizing Mode", Group = "Risk Management", DefaultValue = SizingMode.RiskPercentage)]
         public SizingMode Sizing { get; set; }
 
@@ -52,10 +55,11 @@ namespace cAlgo.Robots
 
         #endregion
 
-        #region Internal Fields
+        #region Private Fields
 
         private AverageTrueRange _atr;
-        private int _currentPositionState; // 0 = Flat, 1 = Long, -1 = Short
+        private TradeType? _pendingSignal = null;
+        private int _pendingSignalBar = -1;
 
         #endregion
 
@@ -63,130 +67,164 @@ namespace cAlgo.Robots
 
         protected override void OnStart()
         {
-            _currentPositionState = 0;
-
             // Wilder's Smoothing matches TradingView ta.atr()
             _atr = Indicators.AverageTrueRange(AtrLength, MovingAverageType.WilderSmoothing);
 
-            // Synchronize state with any active open position on startup
-            SyncPositionState();
-
-            Print("Momentum V6 initialized successfully for symbol {0}.", SymbolName);
+            Print("[INIT] Momentum V6 initialized successfully | Symbol: {0} | TF: {1} | Mom Length: {2} | ATR Length: {3}",
+                SymbolName, TimeFrame, MomentumLength, AtrLength);
         }
 
         protected override void OnBar()
         {
-            // 1. Sync state in case an active position hit Stop Loss / Trailing Stop on previous candle
-            SyncPositionState();
-
-            // 2. Manage ATR Trailing Stop on Bar Close (100% candle-close execution)
+            // 1. Manage ATR Trailing Stop on Completed Candle Close
             ManageAtrTrailingStop();
 
-            // Require enough completed history for lookback calculations
+            // 2. Clear expired pending signals from previous bar
+            if (_pendingSignal.HasValue && _pendingSignalBar != Bars.Count - 1)
+            {
+                Print("[SIGNAL EXPIRED] Pending {0} signal from bar #{1} expired unexecuted.", _pendingSignal, _pendingSignalBar);
+                _pendingSignal = null;
+                _pendingSignalBar = -1;
+            }
+
+            // 3. Require enough completed history for lookback calculations
             if (Bars.Count <= MomentumLength + 2)
                 return;
 
-            // Index 1 = Most recently closed candle
-            // Index 2 = Candle before index 1
+            // Index 1 = Most recently closed candle (t-1)
+            // Index 2 = Candle before index 1 (t-2)
             double currentMom = CalculateMomentum(1);
             double previousMom = CalculateMomentum(2);
 
             bool longCondition = currentMom > 0.0 && currentMom > previousMom;
             bool shortCondition = currentMom < 0.0 && currentMom < previousMom;
 
-            // Signal 1: Buy Signal
-            if (longCondition && _currentPositionState <= 0)
+            var activePosition = GetActivePosition();
+            int currentPositionState = activePosition == null ? 0 : (activePosition.TradeType == TradeType.Buy ? 1 : -1);
+
+            if (longCondition && currentPositionState <= 0)
             {
-                if (IsSpreadAcceptable())
-                {
-                    ExecuteSignal(TradeType.Buy);
-                    _currentPositionState = 1;
-                }
-                else
-                {
-                    Print("Buy signal suppressed due to spread filter ({0:F2} pips > {1:F2} pips)", 
-                        Symbol.Spread / Symbol.PipSize, MaxSpreadPips);
-                }
+                Print("[SIGNAL DETECTED] BULLISH Momentum | Bar #{0} | CurrentMom: {1:F5} > PrevMom: {2:F5}",
+                    Bars.Count - 1, currentMom, previousMom);
+                SetPendingSignal(TradeType.Buy);
             }
-            // Signal 2: Sell Signal
-            else if (shortCondition && _currentPositionState >= 0)
+            else if (shortCondition && currentPositionState >= 0)
             {
-                if (IsSpreadAcceptable())
-                {
-                    ExecuteSignal(TradeType.Sell);
-                    _currentPositionState = -1;
-                }
-                else
-                {
-                    Print("Sell signal suppressed due to spread filter ({0:F2} pips > {1:F2} pips)", 
-                        Symbol.Spread / Symbol.PipSize, MaxSpreadPips);
-                }
+                Print("[SIGNAL DETECTED] BEARISH Momentum | Bar #{0} | CurrentMom: {1:F5} < PrevMom: {2:F5}",
+                    Bars.Count - 1, currentMom, previousMom);
+                SetPendingSignal(TradeType.Sell);
+            }
+
+            // Attempt execution immediately on bar close
+            ProcessPendingSignal();
+        }
+
+        protected override void OnTick()
+        {
+            // Process pending signal if spread was too wide at bar open
+            if (_pendingSignal.HasValue)
+            {
+                ProcessPendingSignal();
             }
         }
 
         #endregion
 
-        #region Private Helper Methods
+        #region Core Execution Engine
 
-        private void SyncPositionState()
+        private Position GetActivePosition()
         {
-            var activePosition = Positions.FirstOrDefault(p => p.Label == InstanceLabel && p.SymbolName == SymbolName);
-            if (activePosition != null)
-            {
-                _currentPositionState = activePosition.TradeType == TradeType.Buy ? 1 : -1;
-            }
-            else
-            {
-                // Reset state to Flat (0) so new signals are allowed
-                _currentPositionState = 0;
-            }
+            return Positions.FirstOrDefault(p => p.Label == InstanceLabel && p.SymbolName == SymbolName);
+        }
+
+        private void SetPendingSignal(TradeType type)
+        {
+            _pendingSignal = type;
+            _pendingSignalBar = Bars.Count - 1;
         }
 
         private double CalculateMomentum(int barIndex)
         {
+            // Close[barIndex] - Close[barIndex + MomentumLength]
             return Bars.ClosePrices.Last(barIndex) - Bars.ClosePrices.Last(barIndex + MomentumLength);
         }
 
-        private bool IsSpreadAcceptable()
+        private void ProcessPendingSignal()
         {
-            double currentSpreadPips = Symbol.Spread / Symbol.PipSize;
-            return currentSpreadPips <= MaxSpreadPips;
-        }
+            if (!_pendingSignal.HasValue)
+                return;
 
-        private void ExecuteSignal(TradeType targetType)
-        {
-            // Close existing position if it's in the opposite direction (Reversal)
-            foreach (var pos in Positions.Where(p => p.Label == InstanceLabel && p.SymbolName == SymbolName))
+            TradeType targetType = _pendingSignal.Value;
+
+            // Check Spread Filter
+            double currentSpreadPips = Symbol.Spread / Symbol.PipSize;
+            if (currentSpreadPips > MaxSpreadPips)
             {
-                if (pos.TradeType != targetType)
-                {
-                    ClosePosition(pos);
-                }
-                else
+                return; // Retries on next tick within the same bar
+            }
+
+            // Handle Active Positions / Atomic Reversals
+            var activePosition = GetActivePosition();
+            if (activePosition != null)
+            {
+                if (activePosition.TradeType == targetType)
                 {
                     // Already holding position in target direction
+                    _pendingSignal = null;
                     return;
+                }
+
+                Print("[REVERSAL] Closing existing {0} position #{1} prior to opening {2}.",
+                    activePosition.TradeType, activePosition.Id, targetType);
+
+                var closeResult = ClosePosition(activePosition);
+                if (!closeResult.IsSuccessful)
+                {
+                    Print("[ERROR] Failed to close position #{0} for reversal. Reason: {1}",
+                        activePosition.Id, closeResult.Error);
+                    return; // Retry on next tick
                 }
             }
 
             // Calculate SL distance in pips based on ATR of previous closed bar
             double atrVal = _atr.Result.Last(1);
-            double slDistancePips = (atrVal * AtrMultiplier) / Symbol.PipSize;
-
-            if (slDistancePips <= 0)
+            if (double.IsNaN(atrVal) || atrVal <= 0)
+            {
+                Print("[ERROR] Invalid ATR value ({0}). Signal aborted.", atrVal);
+                _pendingSignal = null;
                 return;
+            }
+
+            double slDistancePips = (atrVal * AtrMultiplier) / Symbol.PipSize;
+            if (slDistancePips <= 0)
+            {
+                Print("[ERROR] Calculated SL distance ({0:F2} pips) invalid. Signal aborted.", slDistancePips);
+                _pendingSignal = null;
+                return;
+            }
 
             double volumeInUnits = CalculateVolume(slDistancePips);
-
             if (volumeInUnits < Symbol.VolumeInUnitsMin)
             {
-                Print("Calculated volume ({0}) is below symbol minimum ({1}). Order aborted.", 
+                Print("[ERROR] Calculated volume ({0}) below symbol minimum ({1}). Order aborted.",
                     volumeInUnits, Symbol.VolumeInUnitsMin);
+                _pendingSignal = null;
                 return;
             }
 
             // Execute Market Order with initial ATR Stop Loss
-            ExecuteMarketOrder(targetType, SymbolName, volumeInUnits, InstanceLabel, slDistancePips, null);
+            var result = ExecuteMarketOrder(targetType, SymbolName, volumeInUnits, InstanceLabel, slDistancePips, null);
+
+            if (result.IsSuccessful)
+            {
+                Print("[ORDER SUCCESS] #{0} {1} | Vol: {2} units | SL: {3:F1} pips | TP: None",
+                    result.Position.Id, targetType, volumeInUnits, slDistancePips);
+                _pendingSignal = null;
+            }
+            else
+            {
+                Print("[ORDER FAILED] Reason: {0}", result.Error);
+            }
         }
 
         private double CalculateVolume(double slDistancePips)
@@ -199,15 +237,11 @@ namespace cAlgo.Robots
             double capital = CapitalBase == CapitalType.Equity ? Account.Equity : Account.Balance;
             double riskAmount = capital * (RiskPercent / 100.0);
 
-            // Monetary risk per unit = SL distance in pips * PipValue
             double lossPerUnit = slDistancePips * Symbol.PipValue;
-
             if (lossPerUnit <= 0)
                 return Symbol.VolumeInUnitsMin;
 
             double rawVolume = riskAmount / lossPerUnit;
-
-            // Normalize volume to broker steps and limits
             double normalizedVolume = Symbol.NormalizeVolumeInUnits(rawVolume, RoundingMode.Down);
 
             if (normalizedVolume < Symbol.VolumeInUnitsMin)
@@ -221,39 +255,40 @@ namespace cAlgo.Robots
 
         private void ManageAtrTrailingStop()
         {
-            var position = Positions.FirstOrDefault(p => p.Label == InstanceLabel && p.SymbolName == SymbolName);
+            var position = GetActivePosition();
             if (position == null)
                 return;
 
-            // Calculate trailing stop based on closed candle ATR
             double atrVal = _atr.Result.Last(1);
+            if (double.IsNaN(atrVal) || atrVal <= 0)
+                return;
+
             double trailingDistance = atrVal * AtrMultiplier;
+            double minStepInPrice = AtrStepPips * Symbol.PipSize;
 
             if (position.TradeType == TradeType.Buy)
             {
-                // Reference Close of previous bar
-                double targetSl = Bars.ClosePrices.Last(1) - trailingDistance;
+                double currentClose = Bars.ClosePrices.Last(1);
+                double targetSl = currentClose - trailingDistance;
 
-                // Stop loss must only ratchet upward, never widen
-                if (!position.StopLoss.HasValue || targetSl > position.StopLoss.Value + (Symbol.PipSize * 0.1))
+                if (!position.StopLoss.HasValue || (targetSl - position.StopLoss.Value >= minStepInPrice))
                 {
                     ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
+                    Print("[DYNAMIC ATR TRAIL] Updated Buy SL to {0:F5}", targetSl);
                 }
             }
-            else if (position.TradeType == SellType())
+            else if (position.TradeType == TradeType.Sell)
             {
-                // Reference Close of previous bar
-                double targetSl = Bars.ClosePrices.Last(1) + trailingDistance;
+                double currentClose = Bars.ClosePrices.Last(1);
+                double targetSl = currentClose + trailingDistance;
 
-                // Stop loss must only ratchet downward, never widen
-                if (!position.StopLoss.HasValue || targetSl < position.StopLoss.Value - (Symbol.PipSize * 0.1))
+                if (!position.StopLoss.HasValue || (position.StopLoss.Value - targetSl >= minStepInPrice))
                 {
                     ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
+                    Print("[DYNAMIC ATR TRAIL] Updated Sell SL to {0:F5}", targetSl);
                 }
             }
         }
-
-        private TradeType SellType() => TradeType.Sell;
 
         #endregion
     }
