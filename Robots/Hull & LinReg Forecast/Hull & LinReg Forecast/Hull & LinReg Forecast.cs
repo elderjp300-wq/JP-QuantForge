@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using cAlgo.API;
 using cAlgo.API.Indicators;
@@ -23,6 +24,12 @@ namespace cAlgo.Robots
     {
         Balance,
         Equity
+    }
+
+    public enum SignalCategory
+    {
+        PrimaryEntry,
+        ScalingEntry
     }
 
     [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
@@ -50,6 +57,15 @@ namespace cAlgo.Robots
 
         [Parameter("ATR Step Filter (Pips)", Group = "Trailing & Exits", DefaultValue = 0.5, MinValue = 0.1, Step = 0.1)]
         public double AtrStepPips { get; set; }
+
+        [Parameter("Enable Scaling", Group = "Scaling Engine", DefaultValue = false)]
+        public bool EnableScaling { get; set; }
+
+        [Parameter("Max Scaling Positions", Group = "Scaling Engine", DefaultValue = 3, MinValue = 1, MaxValue = 10)]
+        public int MaxPositions { get; set; }
+
+        [Parameter("Allow 0.01 Min Lot Fallback", Group = "Scaling Engine", DefaultValue = true)]
+        public bool AllowMinLotFallback { get; set; }
 
         [Parameter("Sizing Mode", Group = "Position Sizing", DefaultValue = SizingMode.RiskPercentage)]
         public SizingMode Sizing { get; set; }
@@ -83,8 +99,12 @@ namespace cAlgo.Robots
         #region Private Fields
 
         private AverageTrueRange _atr;
-        private TradeType? _pendingSignal = null;
+
+        private TradeType? _pendingSignalType = null;
+        private SignalCategory _pendingSignalCategory = SignalCategory.PrimaryEntry;
         private int _pendingSignalBar = -1;
+        private int _pendingScalingLevel = 0;
+        private bool _isExecutingBasketClose = false;
 
         #endregion
 
@@ -93,25 +113,51 @@ namespace cAlgo.Robots
         protected override void OnStart()
         {
             _atr = Indicators.AverageTrueRange(AtrLength, MovingAverageType.WilderSmoothing);
+            Positions.Closed += OnPositionsClosed;
 
-            Print("[INIT] Hull & LinReg Forecast v2 | Asset: {0} | TF: {1} | TrailingMode: {2} | Risk: {3}% ({4})",
-                SymbolName, TimeFrame, TrailingType, RiskPercent, CapitalBase);
+            if (EnableScaling && MaxPositions < 1)
+            {
+                Print("[WARNING] Max Scaling Positions set to invalid value ({0}). Resetting to 1.", MaxPositions);
+                MaxPositions = 1;
+            }
+
+            Print("[INIT] Hull & LinReg Forecast v2 | Asset: {0} | TF: {1} | Scaling: {2} (Max Pos: {3}) | TrailingMode: {4}",
+                SymbolName, TimeFrame, EnableScaling ? "ENABLED" : "DISABLED", MaxPositions, TrailingType);
+        }
+
+        private void OnPositionsClosed(PositionClosedEventArgs args)
+        {
+            if (_isExecutingBasketClose)
+                return;
+
+            var pos = args.Position;
+            if (pos.Label == InstanceLabel && pos.SymbolName == SymbolName)
+            {
+                var remainingBasket = GetBasketPositions();
+                if (remainingBasket.Count > 0)
+                {
+                    Print("[SCALING EXIT PRIORITY] Position #{0} ({1}) closed by {2}. Liquidation triggered for remaining {3} basket position(s).",
+                        pos.Id, pos.Comment ?? "Primary", args.Reason, remainingBasket.Count);
+
+                    CloseBasket("Stop-Loss Priority Triggered");
+                }
+            }
         }
 
         protected override void OnBar()
         {
-            // 1. Manage Dynamic ATR Trailing on Completed Bar Close
+            // 1. Manage Dynamic ATR Trailing on Completed Bar Close for ALL basket positions
             if (TrailingType == TrailingMode.AtrTrail)
             {
                 ManageDynamicAtrTrailing();
             }
 
             // 2. Clear expired pending signals from previous bar
-            if (_pendingSignal.HasValue && _pendingSignalBar != Bars.Count - 1)
+            if (_pendingSignalType.HasValue && _pendingSignalBar != Bars.Count - 1)
             {
-                Print("[SIGNAL EXPIRED] Pending {0} signal from bar #{1} expired unexecuted.", _pendingSignal, _pendingSignalBar);
-                _pendingSignal = null;
-                _pendingSignalBar = -1;
+                Print("[SIGNAL EXPIRED] Pending {0} ({1}) signal from bar #{2} expired unexecuted.",
+                    _pendingSignalCategory, _pendingSignalType, _pendingSignalBar);
+                ClearPendingSignal();
             }
 
             // 3. Ensure sufficient historical bars exist
@@ -129,27 +175,37 @@ namespace cAlgo.Robots
             bool longCross = (linRegPrev <= hullPrev) && (linRegCurr > hullCurr);
             bool shortCross = (linRegPrev >= hullPrev) && (linRegCurr < hullCurr);
 
+            bool primarySignalFired = false;
+
             if (longCross)
             {
                 Print("[CROSSOVER DETECTED] BULLISH Cross at Bar #{0} | LinReg: {1:F5} > Hull: {2:F5}",
                     Bars.Count - 1, linRegCurr, hullCurr);
-                SetPendingSignal(TradeType.Buy);
+                SetPendingSignal(TradeType.Buy, SignalCategory.PrimaryEntry, 0);
+                primarySignalFired = true;
             }
             else if (shortCross)
             {
                 Print("[CROSSOVER DETECTED] BEARISH Cross at Bar #{0} | LinReg: {1:F5} < Hull: {2:F5}",
                     Bars.Count - 1, linRegCurr, hullCurr);
-                SetPendingSignal(TradeType.Sell);
+                SetPendingSignal(TradeType.Sell, SignalCategory.PrimaryEntry, 0);
+                primarySignalFired = true;
             }
 
-            // 5. Attempt execution immediately if tick conditions permit
+            // 5. Evaluate Risk-Aware Scaling Engine if no primary signal fired on this bar
+            if (!primarySignalFired && EnableScaling)
+            {
+                EvaluateScalingEngine();
+            }
+
+            // 6. Attempt execution immediately if tick conditions permit
             ProcessPendingSignal();
         }
 
         protected override void OnTick()
         {
             // Process pending signal if spread was too wide at bar open
-            if (_pendingSignal.HasValue)
+            if (_pendingSignalType.HasValue)
             {
                 ProcessPendingSignal();
             }
@@ -159,93 +215,282 @@ namespace cAlgo.Robots
 
         #region Core Execution Engine
 
-        private void SetPendingSignal(TradeType type)
+        private List<Position> GetBasketPositions()
         {
-            _pendingSignal = type;
+            return Positions.Where(p => p.Label == InstanceLabel && p.SymbolName == SymbolName)
+                            .OrderBy(p => p.EntryTime)
+                            .ToList();
+        }
+
+        private void SetPendingSignal(TradeType type, SignalCategory category, int scaleLevel)
+        {
+            _pendingSignalType = type;
+            _pendingSignalCategory = category;
+            _pendingScalingLevel = scaleLevel;
             _pendingSignalBar = Bars.Count - 1;
+        }
+
+        private void ClearPendingSignal()
+        {
+            _pendingSignalType = null;
+            _pendingSignalCategory = SignalCategory.PrimaryEntry;
+            _pendingScalingLevel = 0;
+            _pendingSignalBar = -1;
+        }
+
+        private void EvaluateScalingEngine()
+        {
+            var basket = GetBasketPositions();
+            if (basket.Count == 0)
+                return;
+
+            if (basket.Count >= MaxPositions)
+            {
+                return;
+            }
+
+            // Reference latest position in scaling chain
+            var latestPos = basket.Last();
+
+            bool isRiskFree = IsPositionRiskFree(latestPos);
+            bool inProfit = latestPos.GrossProfit > 0;
+
+            if (isRiskFree && inProfit)
+            {
+                int nextLevel = basket.Count;
+                TradeType scaleDirection = latestPos.TradeType;
+
+                Print("[SCALING TRIGGER] Position #{0} (Level {1}) is Risk-Free & in profit. Queueing Scale Level {2} (Position {3}).",
+                    latestPos.Id, nextLevel - 1, nextLevel, GetPositionLetter(nextLevel));
+
+                SetPendingSignal(scaleDirection, SignalCategory.ScalingEntry, nextLevel);
+            }
+        }
+
+        private bool IsPositionRiskFree(Position pos)
+        {
+            if (!pos.StopLoss.HasValue)
+                return false;
+
+            double tolerance = Symbol.PipSize * 0.1;
+
+            if (pos.TradeType == TradeType.Buy)
+            {
+                return pos.StopLoss.Value >= (pos.EntryPrice - tolerance);
+            }
+            else
+            {
+                return pos.StopLoss.Value <= (pos.EntryPrice + tolerance);
+            }
+        }
+
+        private string GetPositionLetter(int level)
+        {
+            return ((char)('A' + level)).ToString();
         }
 
         private void ProcessPendingSignal()
         {
-            if (!_pendingSignal.HasValue)
+            if (!_pendingSignalType.HasValue)
                 return;
 
-            TradeType targetType = _pendingSignal.Value;
+            TradeType targetType = _pendingSignalType.Value;
 
-            // Check Session Filter
+            // Session Filter Check
             if (!IsWithinTradingSession())
             {
-                Print("[EXECUTION BLOCKED] Signal {0} suppressed - outside trading session ({1}:00 UTC).",
-                    targetType, Server.Time.Hour);
-                _pendingSignal = null;
+                Print("[EXECUTION BLOCKED] {0} {1} suppressed - outside trading session ({2}:00 UTC).",
+                    _pendingSignalCategory, targetType, Server.Time.Hour);
+                ClearPendingSignal();
                 return;
             }
 
-            // Check Spread Condition
+            // Spread Condition Check
             double currentSpreadPips = Symbol.Spread / Symbol.PipSize;
             if (currentSpreadPips > MaxSpreadPips)
             {
-                // Wait for next tick within the same bar
-                return;
+                return; // Retry on next tick within the same bar
             }
 
-            // Handle Active Positions / Atomic Reversals
-            var activePosition = Positions.FirstOrDefault(p => p.Label == InstanceLabel && p.SymbolName == SymbolName);
-            if (activePosition != null)
+            if (_pendingSignalCategory == SignalCategory.PrimaryEntry)
             {
-                if (activePosition.TradeType == targetType)
+                ExecutePrimaryEntry(targetType);
+            }
+            else if (_pendingSignalCategory == SignalCategory.ScalingEntry)
+            {
+                ExecuteScalingEntry(targetType, _pendingScalingLevel);
+            }
+        }
+
+        private void ExecutePrimaryEntry(TradeType targetType)
+        {
+            var basket = GetBasketPositions();
+            if (basket.Count > 0)
+            {
+                var firstPos = basket.First();
+                if (firstPos.TradeType == targetType)
                 {
-                    _pendingSignal = null;
+                    ClearPendingSignal();
                     return;
                 }
 
-                Print("[REVERSAL] Closing existing {0} position #{1} prior to opening {2}.",
-                    activePosition.TradeType, activePosition.Id, targetType);
+                Print("[REVERSAL] Opposite signal detected. Closing active basket of {0} position(s) prior to opening {1}.",
+                    basket.Count, targetType);
 
-                var closeResult = ClosePosition(activePosition);
-                if (!closeResult.IsSuccessful)
+                if (!CloseBasket("Strategy Reversal"))
                 {
-                    Print("[ERROR] Failed to close position #{0} for reversal. Reason: {1}",
-                        activePosition.Id, closeResult.Error);
-                    return; // Will retry on next tick
+                    return; // Retry on next tick if close failed
                 }
             }
 
-            // Calculate SL Distance
             double slDistancePips = GetInitialStopLossPips();
             if (slDistancePips <= 0)
             {
-                Print("[ERROR] Invalid SL distance ({0:F2} pips). Signal aborted.", slDistancePips);
-                _pendingSignal = null;
+                Print("[ERROR] Primary entry SL distance ({0:F2} pips) invalid. Order aborted.", slDistancePips);
+                ClearPendingSignal();
                 return;
             }
 
-            // Calculate Volume
             double volumeInUnits = CalculateVolume(slDistancePips);
             if (volumeInUnits < Symbol.VolumeInUnitsMin)
             {
-                Print("[ERROR] Calculated volume ({0}) below symbol minimum ({1}). Order aborted.",
+                Print("[ERROR] Primary entry volume ({0}) below minimum ({1}). Order aborted.",
                     volumeInUnits, Symbol.VolumeInUnitsMin);
-                _pendingSignal = null;
+                ClearPendingSignal();
                 return;
             }
 
-            // Native Trailing Flag (True only for PipsTrail mode)
             bool useNativeTsl = (TrailingType == TrailingMode.PipsTrail);
+            string comment = "Position_A";
 
-            // Execute Market Order
-            var result = ExecuteMarketOrder(targetType, SymbolName, volumeInUnits, InstanceLabel, slDistancePips, null, null, useNativeTsl);
-            
+            var result = ExecuteMarketOrder(targetType, SymbolName, volumeInUnits, InstanceLabel, slDistancePips, null, comment, useNativeTsl);
+
             if (result.IsSuccessful)
             {
-                Print("[ORDER SUCCESS] #{0} {1} | Vol: {2} units | SL: {3:F1} pips | Native TSL: {4}",
-                    result.Position.Id, targetType, volumeInUnits, slDistancePips, useNativeTsl);
-                _pendingSignal = null;
+                Print("[ORDER SUCCESS] Primary Position A #{0} {1} | Vol: {2} units | SL: {3:F1} pips | Mode: {4}",
+                    result.Position.Id, targetType, volumeInUnits, slDistancePips, TrailingType);
+                ClearPendingSignal();
             }
             else
             {
                 Print("[ORDER FAILED] Reason: {0}", result.Error);
             }
+        }
+
+        private void ExecuteScalingEntry(TradeType targetType, int level)
+        {
+            var basket = GetBasketPositions();
+            if (basket.Count == 0)
+            {
+                Print("[SCALING SKIPPED] Primary position no longer active.");
+                ClearPendingSignal();
+                return;
+            }
+
+            if (basket.Count >= MaxPositions)
+            {
+                Print("[SCALING SKIPPED] Maximum basket positions ({0}) reached.", MaxPositions);
+                ClearPendingSignal();
+                return;
+            }
+
+            var posA = basket.First();
+            double originalVolume = posA.VolumeInUnits;
+
+            double slDistancePips = GetInitialStopLossPips();
+            if (slDistancePips <= 0)
+            {
+                Print("[SCALING SKIPPED] Calculated SL distance ({0:F2} pips) invalid.", slDistancePips);
+                ClearPendingSignal();
+                return;
+            }
+
+            double scalingVolume = CalculateScalingVolume(slDistancePips, originalVolume);
+            if (scalingVolume <= 0)
+            {
+                ClearPendingSignal();
+                return;
+            }
+
+            bool useNativeTsl = (TrailingType == TrailingMode.PipsTrail);
+            string comment = string.Format("Position_{0}", GetPositionLetter(level));
+
+            var result = ExecuteMarketOrder(targetType, SymbolName, scalingVolume, InstanceLabel, slDistancePips, null, comment, useNativeTsl);
+
+            if (result.IsSuccessful)
+            {
+                Print("[SCALING SUCCESS] Scale Position {0} (Level {1}) #{2} {3} | Vol: {4} units | SL: {5:F1} pips",
+                    GetPositionLetter(level), level, result.Position.Id, targetType, scalingVolume, slDistancePips);
+                ClearPendingSignal();
+            }
+            else
+            {
+                Print("[SCALING FAILED] Broker rejected order. Reason: {0}", result.Error);
+            }
+        }
+
+        private double CalculateScalingVolume(double slDistancePips, double originalVolume)
+        {
+            double calculatedVolume = CalculateVolume(slDistancePips);
+
+            // Cap volume at original Position A volume
+            if (calculatedVolume > originalVolume)
+            {
+                calculatedVolume = originalVolume;
+            }
+
+            // Min lot fallback logic
+            if (calculatedVolume < Symbol.VolumeInUnitsMin)
+            {
+                if (AllowMinLotFallback)
+                {
+                    Print("[SCALING VOLUME] Calculated scaling volume ({0}) below minimum. Fallback to minimum lot size ({1} units) applied.",
+                        calculatedVolume, Symbol.VolumeInUnitsMin);
+                    calculatedVolume = Symbol.VolumeInUnitsMin;
+                }
+                else
+                {
+                    Print("[SCALING SKIPPED] Calculated scaling volume ({0}) below minimum allowed ({1}). Fallback disabled.",
+                        calculatedVolume, Symbol.VolumeInUnitsMin);
+                    return 0;
+                }
+            }
+
+            // Free Margin Check (1:20 Leverage Protection)
+            double requiredMargin = Symbol.GetEstimatedMargin(TradeType.Buy, calculatedVolume);
+            if (Account.FreeMargin < requiredMargin)
+            {
+                Print("[SCALING SKIPPED] Insufficient Free Margin ({0:F2}) for required margin ({1:F2}). Scale aborted.",
+                    Account.FreeMargin, requiredMargin);
+                return 0;
+            }
+
+            return calculatedVolume;
+        }
+
+        private bool CloseBasket(string reason)
+        {
+            var basket = GetBasketPositions();
+            if (basket.Count == 0)
+                return true;
+
+            _isExecutingBasketClose = true;
+            bool allSuccessful = true;
+
+            Print("[BASKET CLOSE] Closing all {0} position(s) in basket. Reason: {1}", basket.Count, reason);
+
+            foreach (var pos in basket)
+            {
+                var result = ClosePosition(pos);
+                if (!result.IsSuccessful)
+                {
+                    Print("[ERROR] Failed to close basket position #{0}. Reason: {1}", pos.Id, result.Error);
+                    allSuccessful = false;
+                }
+            }
+
+            _isExecutingBasketClose = false;
+            return allSuccessful;
         }
 
         private double GetInitialStopLossPips()
@@ -255,7 +500,6 @@ namespace cAlgo.Robots
                 return PipsStopLoss;
             }
 
-            // AtrTrail or Disabled with ATR
             double atrVal = _atr.Result.Last(1);
             if (double.IsNaN(atrVal) || atrVal <= 0)
                 return PipsStopLoss;
@@ -291,8 +535,8 @@ namespace cAlgo.Robots
 
         private void ManageDynamicAtrTrailing()
         {
-            var position = Positions.FirstOrDefault(p => p.Label == InstanceLabel && p.SymbolName == SymbolName);
-            if (position == null)
+            var basket = GetBasketPositions();
+            if (basket.Count == 0)
                 return;
 
             double atrVal = _atr.Result.Last(1);
@@ -301,27 +545,31 @@ namespace cAlgo.Robots
 
             double trailDistance = atrVal * AtrSlMultiplier;
             double minStepInPrice = AtrStepPips * Symbol.PipSize;
+            double currentClose = Bars.ClosePrices.Last(1);
 
-            if (position.TradeType == TradeType.Buy)
+            foreach (var position in basket)
             {
-                double currentClose = Bars.ClosePrices.Last(1);
-                double targetSl = currentClose - trailDistance;
-
-                if (!position.StopLoss.HasValue || (targetSl - position.StopLoss.Value >= minStepInPrice))
+                if (position.TradeType == TradeType.Buy)
                 {
-                    ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
-                    Print("[DYNAMIC ATR TRAIL] Updated Buy SL to {0:F5} (Step >= {1:F1} pips)", targetSl, AtrStepPips);
+                    double targetSl = currentClose - trailDistance;
+
+                    if (!position.StopLoss.HasValue || (targetSl - position.StopLoss.Value >= minStepInPrice))
+                    {
+                        ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
+                        Print("[DYNAMIC ATR TRAIL] Updated Buy SL for #{0} ({1}) to {2:F5} (Step >= {3:F1} pips)",
+                            position.Id, position.Comment ?? "Primary", targetSl, AtrStepPips);
+                    }
                 }
-            }
-            else if (position.TradeType == TradeType.Sell)
-            {
-                double currentClose = Bars.ClosePrices.Last(1);
-                double targetSl = currentClose + trailDistance;
-
-                if (!position.StopLoss.HasValue || (position.StopLoss.Value - targetSl >= minStepInPrice))
+                else if (position.TradeType == TradeType.Sell)
                 {
-                    ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
-                    Print("[DYNAMIC ATR TRAIL] Updated Sell SL to {0:F5} (Step >= {1:F1} pips)", targetSl, AtrStepPips);
+                    double targetSl = currentClose + trailDistance;
+
+                    if (!position.StopLoss.HasValue || (position.StopLoss.Value - targetSl >= minStepInPrice))
+                    {
+                        ModifyPosition(position, targetSl, position.TakeProfit, ProtectionType.Absolute);
+                        Print("[DYNAMIC ATR TRAIL] Updated Sell SL for #{0} ({1}) to {2:F5} (Step >= {3:F1} pips)",
+                            position.Id, position.Comment ?? "Primary", targetSl, AtrStepPips);
+                    }
                 }
             }
         }
